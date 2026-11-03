@@ -25,6 +25,8 @@ export { AzureMonitorLogRecordExporter } from "./exporter/log.js";
 export { AzureMonitorSpanExporter } from "./exporter/trace.js";
 export type {
   BrowserInstrumentation,
+  MicrosoftOpenTelemetryBrowserConfigurationSync,
+  MicrosoftOpenTelemetryBrowserConfigurationSyncOptions,
   MicrosoftOpenTelemetryBrowser,
   MicrosoftOpenTelemetryBrowserInstrumentations,
   MicrosoftOpenTelemetryBrowserOptions,

@@ -52,13 +52,17 @@ interface CapturedUpdate extends Partial<Lifetimes> {
 const networkGates = ["disableFetchTracking", "disableAjaxTracking"] as const;
 
 /** Captures own data properties before queuing, without invoking application getters. */
-function fields(value: unknown, path: string, allowed: readonly string[]): Record<string, unknown> {
+export function fields(
+  value: unknown,
+  path: string,
+  allowed: readonly string[],
+): Record<string, unknown> {
   const prototype: unknown =
     value && typeof value === "object" ? Object.getPrototypeOf(value) : undefined;
   if (prototype !== Object.prototype && prototype !== null) {
     throw new TypeError(`${path} must be a plain object.`);
   }
-  const result: Record<string, unknown> = {};
+  const result = Object.create(null) as Record<string, unknown>;
   for (const key of Reflect.ownKeys(value as object)) {
     if (typeof key !== "string" || !allowed.includes(key)) {
       throw new TypeError(`Unsupported configuration path: ${path}${String(key)}.`);
@@ -185,10 +189,13 @@ export function createRuntimeConfiguration(
   initial: MicrosoftOpenTelemetryBrowserConfigurationUpdate,
   isStopped: () => boolean,
   applyNetworkGates?: (next: ReturnType<typeof snapshot>) => void,
+  protectSampling = false,
 ) {
   let current = snapshot(capture(initial));
   let revision = 0;
   let queue = Promise.resolve();
+  const protectedPaths = new Set<string>(protectSampling ? ["samplingPercentage"] : []);
+  const syncPaths = ["samplingPercentage", ...networkGates];
 
   function enqueue<T>(operation: () => T): Promise<T> {
     const result = queue.then(() => {
@@ -202,49 +209,84 @@ export function createRuntimeConfiguration(
     return result;
   }
 
+  function update(
+    patch: MicrosoftOpenTelemetryBrowserConfigurationUpdate,
+    mergeExisting = true,
+    accept?: () => boolean,
+    excluded: ReadonlySet<string> = new Set(),
+  ): Promise<MicrosoftOpenTelemetryBrowserConfigurationUpdateResult> {
+    let update: CapturedUpdate;
+    try {
+      if (typeof mergeExisting !== "boolean") {
+        throw new TypeError("mergeExisting must be a boolean.");
+      }
+      update = capture(patch);
+    } catch (error) {
+      return Promise.reject(
+        error instanceof Error ? error : new TypeError("Invalid configuration.", { cause: error }),
+      );
+    }
+    return enqueue(() => {
+      if (accept) {
+        if (!accept())
+          return Object.freeze({ revision, changedPaths: Object.freeze([] as string[]) });
+        for (const key of syncPaths) {
+          if (protectedPaths.has(key) || excluded.has(key))
+            delete update[key as keyof CapturedUpdate];
+        }
+      }
+      const next = snapshot(update, mergeExisting ? current : undefined);
+      const changedPaths: string[] = [];
+      if (next.samplingPercentage !== current.samplingPercentage)
+        changedPaths.push("samplingPercentage");
+      for (const key of Object.keys(defaults) as (keyof Lifetimes)[]) {
+        if (next.session[key] !== current.session[key]) changedPaths.push(`session.${key}`);
+      }
+      if (next.azureMonitor.disableBeacon !== current.azureMonitor.disableBeacon)
+        changedPaths.push("azureMonitor.disableBeacon");
+      const gatesChanged = networkGates.filter((key) => next[key] !== current[key]);
+      changedPaths.push(...gatesChanged);
+      if (gatesChanged.length) applyNetworkGates?.(next);
+      if (isStopped()) throw new Error("Telemetry instance is stopped.");
+      if (accept && !accept()) {
+        if (gatesChanged.length) applyNetworkGates?.(current);
+        return Object.freeze({ revision, changedPaths: Object.freeze([] as string[]) });
+      }
+      if (changedPaths.length) {
+        current = next;
+        revision++;
+      }
+      if (!accept) {
+        for (const key of syncPaths) {
+          if (!mergeExisting || Object.hasOwn(update, key)) protectedPaths.add(key);
+        }
+      }
+      return Object.freeze({
+        revision,
+        changedPaths: Object.freeze(changedPaths),
+      });
+    });
+  }
+
   return {
     snapshot: () => current,
     enqueue,
-    updateCfg(
+    updateCfg: (patch: MicrosoftOpenTelemetryBrowserConfigurationUpdate, mergeExisting = true) =>
+      update(patch, mergeExisting),
+    receive: (
       patch: MicrosoftOpenTelemetryBrowserConfigurationUpdate,
-      mergeExisting = true,
-    ): Promise<MicrosoftOpenTelemetryBrowserConfigurationUpdateResult> {
-      let update: CapturedUpdate;
+      accept: () => boolean,
+      excluded: ReadonlySet<string>,
+    ) => {
       try {
-        if (typeof mergeExisting !== "boolean") {
-          throw new TypeError("mergeExisting must be a boolean.");
-        }
-        update = capture(patch);
+        return update(fields(patch, "cfg.", syncPaths), true, accept, new Set(excluded));
       } catch (error) {
         return Promise.reject(
           error instanceof Error
             ? error
-            : new TypeError("Invalid configuration.", { cause: error }),
+            : new TypeError("Invalid synchronized configuration.", { cause: error }),
         );
       }
-      return enqueue(() => {
-        const next = snapshot(update, mergeExisting ? current : undefined);
-        const changedPaths: string[] = [];
-        if (next.samplingPercentage !== current.samplingPercentage)
-          changedPaths.push("samplingPercentage");
-        for (const key of Object.keys(defaults) as (keyof Lifetimes)[]) {
-          if (next.session[key] !== current.session[key]) changedPaths.push(`session.${key}`);
-        }
-        if (next.azureMonitor.disableBeacon !== current.azureMonitor.disableBeacon)
-          changedPaths.push("azureMonitor.disableBeacon");
-        const gatesChanged = networkGates.filter((key) => next[key] !== current[key]);
-        changedPaths.push(...gatesChanged);
-        if (gatesChanged.length) applyNetworkGates?.(next);
-        if (isStopped()) throw new Error("Telemetry instance is stopped.");
-        if (changedPaths.length) {
-          current = next;
-          revision++;
-        }
-        return Object.freeze({
-          revision,
-          changedPaths: Object.freeze(changedPaths),
-        });
-      });
     },
   };
 }

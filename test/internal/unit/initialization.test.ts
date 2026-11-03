@@ -27,9 +27,10 @@ import {
 import { isUnloading } from "../../../src/exporter/common.js";
 import { AzureMonitorLogRecordExporter } from "../../../src/exporter/log.js";
 import { AzureMonitorSpanExporter } from "../../../src/exporter/trace.js";
+import { PageViewInstrumentation } from "../../../src/instrumentation/pageView/index.js";
 import { noopLoggerProvider, noopTracerProvider } from "../../../src/routing/instanceRouter.js";
 import { startTelemetryInstance } from "../../../src/routing/telemetryInstance.js";
-import { getSharedRegistry } from "../../../src/shared/globalOwnership.js";
+import { getRegisteredGlobal, getSharedRegistry } from "../../../src/shared/globalOwnership.js";
 import { DEFAULT_QUERY_STRINGS_TO_REDACT } from "../../../src/shared/urlRedaction.js";
 import { createInMemoryPipeline } from "../../fixtures/telemetry.js";
 import { AZURE_MONITOR_SAMPLE_RATE, RuntimeSampler } from "../../../src/sampling.js";
@@ -185,6 +186,205 @@ it("honors an inherited startup sampling getter and captures its value once", as
   expect(sample().decision).toBe(SamplingDecision.RECORD_AND_SAMPLED);
   expect(read).toHaveBeenCalledOnce();
 });
+
+it.each([undefined, {}, { AppInsightsCfgSyncPlugin: undefined }])(
+  "does not install configuration sync without opt-in: %j",
+  async (extensionConfig) => {
+    const addListener = vi.spyOn(globalThis, "addEventListener");
+    vi.mocked(startTelemetryInstance).mockResolvedValueOnce(fakeInstance());
+    const handle = await useMicrosoftOpenTelemetry({
+      extensionConfig,
+      pageView: { enabled: false },
+      session: { enabled: false },
+      userContext: { enabled: false },
+      storage: { enabled: false },
+    });
+    handles.add(handle);
+
+    expect(Object.hasOwn(handle, "configSync")).toBe(false);
+    expect(handle.configSync).toBeUndefined();
+    expect(addListener.mock.calls.filter(([name]) => name === "ai_cfgsync")).toHaveLength(0);
+  },
+);
+
+it.each(["inherited", "own undefined", "omitted"] as const)(
+  "protects startup sampling from sync only when supplied: %s",
+  async (kind) => {
+    const options: MicrosoftOpenTelemetryBrowserOptions = {
+      extensionConfig: { AppInsightsCfgSyncPlugin: {} },
+      pageView: { enabled: false },
+      session: { enabled: false },
+      userContext: { enabled: false },
+      storage: { enabled: false },
+    };
+    if (kind === "inherited") Object.setPrototypeOf(options, { samplingPercentage: 0 });
+    if (kind === "own undefined") options.samplingPercentage = undefined;
+    vi.mocked(startTelemetryInstance).mockResolvedValueOnce(fakeInstance());
+    const handle = await useMicrosoftOpenTelemetry(options);
+    handles.add(handle);
+    expect(Object.hasOwn(handle, "configSync")).toBe(true);
+    expect(handle.configSync).toBeDefined();
+    const sampler = vi.mocked(startTelemetryInstance).mock.calls[0]?.[0].sampler;
+    if (!sampler) throw new Error("Expected telemetry instance sampler");
+    const sample = () =>
+      sampler.shouldSample(
+        ROOT_CONTEXT,
+        "00000000000000000000000000000001",
+        "operation",
+        SpanKind.INTERNAL,
+        {},
+        [],
+      ).decision;
+    expect(sample()).toBe(
+      kind === "inherited" ? SamplingDecision.NOT_RECORD : SamplingDecision.RECORD_AND_SAMPLED,
+    );
+
+    globalThis.dispatchEvent(
+      new CustomEvent("ai_cfgsync", {
+        detail: { cfg: { samplingPercentage: kind === "inherited" ? 100 : 0 } },
+      }),
+    );
+    await handle.updateCfg({});
+    expect(sample()).toBe(
+      kind === "own undefined" ? SamplingDecision.RECORD_AND_SAMPLED : SamplingDecision.NOT_RECORD,
+    );
+  },
+);
+
+it("reads the startup extension getter once and does not broadcast automatically", async () => {
+  const read = vi.fn(() => {
+    if (read.mock.calls.length > 1) throw new Error("extensionConfig read twice");
+    return { AppInsightsCfgSyncPlugin: { syncMode: 1 as const } };
+  });
+  const options: MicrosoftOpenTelemetryBrowserOptions = {
+    pageView: { enabled: false },
+    session: { enabled: false },
+    userContext: { enabled: false },
+    storage: { enabled: false },
+  };
+  Object.defineProperty(options, "extensionConfig", { enumerable: true, get: read });
+  const dispatch = vi.spyOn(globalThis, "dispatchEvent");
+  vi.mocked(startTelemetryInstance).mockResolvedValueOnce(fakeInstance());
+  const handle = await useMicrosoftOpenTelemetry(options);
+  handles.add(handle);
+
+  expect(read).toHaveBeenCalledOnce();
+  expect(handle.configSync).toBeDefined();
+  expect(dispatch.mock.calls.filter(([event]) => event.type === "ai_cfgsync")).toHaveLength(0);
+  await handle.configSync!.sync();
+  expect(dispatch.mock.calls.filter(([event]) => event.type === "ai_cfgsync")).toHaveLength(1);
+  expect(read).toHaveBeenCalledOnce();
+});
+
+it("rejects nested sync option accessors before SDK startup or storage access", async () => {
+  const getter = vi.fn(() => 2);
+  const local = vi.spyOn(window, "localStorage", "get");
+  const session = vi.spyOn(window, "sessionStorage", "get");
+  const addListener = vi.spyOn(globalThis, "addEventListener");
+  for (const extensionConfig of [
+    Object.defineProperty({}, "AppInsightsCfgSyncPlugin", { get: getter }),
+    { AppInsightsCfgSyncPlugin: Object.defineProperty({}, "syncMode", { get: getter }) },
+    {
+      AppInsightsCfgSyncPlugin: {
+        nonOverrideConfigs: Object.defineProperty({}, "samplingPercentage", { get: getter }),
+      },
+    },
+  ]) {
+    await expect(useMicrosoftOpenTelemetry({ extensionConfig })).rejects.toThrow(TypeError);
+  }
+  expect(getter).not.toHaveBeenCalled();
+  expect(startTelemetryInstance).not.toHaveBeenCalled();
+  expect(local).not.toHaveBeenCalled();
+  expect(session).not.toHaveBeenCalled();
+  expect(addListener).not.toHaveBeenCalled();
+});
+
+it.each(["fake", "real"] as const)(
+  "rolls back %s startup when sync listener registration throws after installation",
+  async (kind) => {
+    const upstream = fakeInstance();
+    if (kind === "fake") vi.mocked(startTelemetryInstance).mockResolvedValueOnce(upstream);
+    const pipeline = createInMemoryPipeline();
+    const instrumentation = {
+      setTracerProvider: vi.fn(),
+      getConfig: vi.fn(() => ({ enabled: false })),
+      enable: vi.fn(),
+      disable: vi.fn(),
+    };
+    const commitPageView = vi.spyOn(PageViewInstrumentation.prototype, "commitStartup");
+    const rollbackPageView = vi.spyOn(PageViewInstrumentation.prototype, "rollbackStartup");
+    const globals = (["trace", "logs", "context", "propagation"] as const).map((name) =>
+      getRegisteredGlobal(name),
+    );
+    const failure = new Error("listener registration failed");
+    const nativeAdd = globalThis.addEventListener.bind(globalThis);
+    const nativeRemove = globalThis.removeEventListener.bind(globalThis);
+    let installed: EventListenerOrEventListenerObject | null = null;
+    let removals = 0;
+    vi.spyOn(globalThis, "removeEventListener").mockImplementation((name, listener, options) => {
+      if (name === "ai_cfgsync" && listener === installed) {
+        removals++;
+        if (removals === 1) throw new Error("first removal failed");
+      }
+      nativeRemove(name, listener, options);
+    });
+    vi.spyOn(globalThis, "addEventListener").mockImplementation((name, listener, options) => {
+      nativeAdd(name, listener, options);
+      if (name === "ai_cfgsync") {
+        installed = listener;
+        expect(instrumentation.enable).toHaveBeenCalledOnce();
+        expect(upstream.commit).not.toHaveBeenCalled();
+        expect(commitPageView).not.toHaveBeenCalled();
+        globalThis.dispatchEvent(
+          new CustomEvent(name, { detail: { cfg: { samplingPercentage: 0 } } }),
+        );
+        throw failure;
+      }
+    });
+
+    await expect(
+      useMicrosoftOpenTelemetry({
+        ...pipeline.options,
+        extensionConfig: { AppInsightsCfgSyncPlugin: {} },
+        instrumentations: [instrumentation],
+        session: { enabled: false },
+        userContext: { enabled: false },
+        storage: { enabled: false },
+      }),
+    ).rejects.toBe(failure);
+    expect(installed).not.toBeNull();
+    expect(removals).toBe(2);
+    expect(instrumentation.disable).toHaveBeenCalledOnce();
+    expect(commitPageView).not.toHaveBeenCalled();
+    expect(rollbackPageView).toHaveBeenCalledOnce();
+    if (kind === "fake") {
+      expect(upstream.commit).not.toHaveBeenCalled();
+      expect(upstream.abort).toHaveBeenCalledOnce();
+      expect(upstream.shutdown).toHaveBeenCalledOnce();
+      await pipeline.shutdown();
+    } else {
+      expect(
+        (["trace", "logs", "context", "propagation"] as const).map(getRegisteredGlobal),
+      ).toEqual(globals);
+    }
+    const sampler = vi.mocked(startTelemetryInstance).mock.calls[0]?.[0].sampler;
+    if (!sampler) throw new Error("Expected telemetry instance sampler");
+    expect(
+      sampler.shouldSample(
+        ROOT_CONTEXT,
+        "00000000000000000000000000000001",
+        "operation",
+        SpanKind.INTERNAL,
+        {},
+        [],
+      ).decision,
+    ).toBe(SamplingDecision.RECORD_AND_SAMPLED);
+    const observed = vi.fn(() => []);
+    const cfg = new Proxy({}, { ownKeys: observed });
+    globalThis.dispatchEvent(new CustomEvent("ai_cfgsync", { detail: { cfg } }));
+    expect(observed).not.toHaveBeenCalled();
+  },
+);
 
 it("captures an enumerable startup beacon getter once", async () => {
   const read = vi.fn(() => true);

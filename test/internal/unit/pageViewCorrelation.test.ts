@@ -447,6 +447,23 @@ it.each([
   },
 );
 
+it.each(["inherited", "non-enumerable"] as const)(
+  "preserves the scoped startup context from an %s context manager property",
+  async (kind) => {
+    const manager = new StackContextManager();
+    const existing = { traceId: "1".repeat(32), spanId: "2".repeat(16), traceFlags: 1 };
+    const traces =
+      kind === "inherited"
+        ? (Object.create({ contextManager: manager }) as { contextManager: StackContextManager })
+        : Object.defineProperty({}, "contextManager", { value: manager });
+    const pipeline = await manager.with(trace.setSpanContext(ROOT_CONTEXT, existing), () =>
+      start({ traces, spanProcessors: [], session: { enabled: false } }),
+    );
+    pipeline.logger.emit({ body: "descriptor context" });
+    expect(pipeline.onLog.mock.calls.at(-1)![0].spanContext).toEqual(existing);
+  },
+);
+
 it.each([
   { traceId: "0".repeat(32), spanId: "2".repeat(16), traceFlags: 1 },
   { traceId: "1".repeat(32), spanId: "0".repeat(16), traceFlags: 1 },

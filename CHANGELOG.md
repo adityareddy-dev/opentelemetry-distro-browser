@@ -6,6 +6,11 @@ All notable changes to this package are documented in this file.
 
 ### Added
 
+- Add opt-in same-realm configuration synchronization through
+  `extensionConfig.AppInsightsCfgSyncPlugin`. Support explicit broadcast-only and receive-only
+  modes for sampling and fetch/XHR gates, with local precedence, pause/resume/shutdown controls, and
+  safe receiver error callbacks. Synchronization does not use HTTP, storage, cross-document
+  delivery, retained history, or automatic publishing of local updates.
 - Support instance-local runtime instrumentation add/remove/replace with explicit IDs,
   provider binding, ownership transfer, network-gate preservation and best-effort rollback.
 - Add instance-local `instrumentations.get(id)` and supported pause/resume via

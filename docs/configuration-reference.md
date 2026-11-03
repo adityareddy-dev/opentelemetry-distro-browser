@@ -229,9 +229,75 @@ updates cannot enable a disabled session or change persistence; `storage.enabled
 `storage.namePrefix` remain unchanged. Only sampling, session lifetimes and Azure Monitor beacon
 fallback policy, plus the two fetch/XHR collection gates, are supported by `updateCfg`.
 Instrumentation pause/resume and supported add/remove/replace operations use the separate handle
-controls below; configuration synchronization is not supported. The runtime `azureMonitor` subset
-does not accept `connectionString`, `initTimeOut` or `initInMemoMaxSize`, and cannot replace or
-disable a destination. There is no root `connectionString` alias.
+controls below. The runtime `azureMonitor` subset does not accept `connectionString`, `initTimeOut`
+or `initInMemoMaxSize`, and cannot replace or disable a destination. There is no root
+`connectionString` alias.
+
+### Optional configuration synchronization
+
+`extensionConfig.AppInsightsCfgSyncPlugin` is a startup-only option for synchronizing a narrow
+runtime subset between SDK instances in the **same JavaScript realm**. It is not accepted by the CDN loader. It
+uses `CustomEvent` on `globalThis`, not HTTP, storage, network requests, tabs, iframes or workers;
+those contexts have independent realm state.
+
+| Option                | Default and behavior                                                                                                                                                                                              |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Plugin options object | Omitted: synchronization is not configured. When configured, the handle exposes `configSync` with `sync(): Promise<void>`, `pause()`, `resume()`, and `shutdown()`.                                               |
+| `syncMode`            | `2` (receive only). `0` is inert, `1` broadcasts only, and `2` receives only.                                                                                                                                     |
+| `customEvtName`       | `"ai_cfgsync"`. This event name is the channel; use a different name to isolate participants.                                                                                                                     |
+| `nonOverrideConfigs`  | Optional map for `samplingPercentage`, `disableFetchTracking`, and `disableAjaxTracking`. `true` excludes a field from publishing and receiving; `false` cannot widen the allowlist. Unknown keys reject startup. |
+| `onError`             | Optional `(error: unknown) => void` callback. Thrown errors and rejected returns are isolated.                                                                                                                    |
+
+Synchronization starts only after an explicit `AppInsightsCfgSyncPlugin` object is supplied, including `{}`.
+Startup configuration establishes local precedence: an actual startup sampling value, including an
+own `undefined` or inherited numeric value, protects sampling from received updates. A successful
+local `updateCfg` permanently protects each field it supplies, including no-op updates and explicit
+resets; `updateCfg(patch, false)` protects all three synchronizable fields. Failed local updates
+do not create a protection. There is no API to release a protection.
+
+Only `samplingPercentage` (a finite value from `0` through `100` or explicit `undefined`),
+`disableFetchTracking`, and `disableAjaxTracking` may cross the channel. The latter two accept only
+booleans in events. The SDK rejects unknown fields and session, beacon,
+identity, destination, instrumentation, state, and HTTP-related settings. It validates the whole
+received payload before applying locks or allow-list filtering. This intentionally strict subset is
+not compatible with a full Application Insights configuration object or full plugin configuration.
+
+An explicit local `updateCfg` remains local: it does not automatically publish, echo a received
+update, replay a value on startup, or retain history. A broadcaster publishes a snapshot of every
+allowed, non-excluded field, including an own `undefined` sampling reset, through:
+
+```typescript
+globalThis.dispatchEvent(new CustomEvent(channel, { detail: { cfg: patch } }));
+```
+
+For example, configure separate publisher and receiver instances on the same page:
+
+```typescript
+const publisher = await useMicrosoftOpenTelemetry({
+  extensionConfig: { AppInsightsCfgSyncPlugin: { syncMode: 1, customEvtName: "checkout-config" } },
+});
+const receiver = await useMicrosoftOpenTelemetry({
+  extensionConfig: { AppInsightsCfgSyncPlugin: { customEvtName: "checkout-config" } },
+});
+
+await publisher.updateCfg({ samplingPercentage: 25 }); // Local only.
+await publisher.configSync!.sync(); // Dispatch completion, not receiver acknowledgement.
+await receiver.updateCfg({}); // Barrier for previously queued delivery on this receiver.
+```
+
+Receivers merge queued messages through the same `updateCfg` and instrumentation-mutation queue,
+but each handle has an independent revision; there is no atomic cross-handle commit. `sync()`
+resolves when dispatch is complete, not when recipients acknowledge or apply it. Receiver failures
+call `onError`, do not roll back the publisher, and do not log payload contents.
+
+`pause()` cancels queued broadcasts and delivery for its current generation without reverting
+already applied values. `resume()` enables future messages only; it does not replay a snapshot.
+`shutdown()` is terminal and removes the event listener. Initialization stages the listener and
+removes it if startup fails before commit; telemetry shutdown also removes it.
+If removal throws, shutdown attempts one bounded retry and still reports the original error.
+
+The channel is not authentication or confidentiality protection. Any script in the same realm can
+observe or forge these events, so do not synchronize secrets.
 
 ## Session and identity
 
@@ -624,6 +690,7 @@ exporters, context managers, propagators and resource detectors require npm-base
 Loader options are unchanged: use `azureMonitor.disableBeacon`, not the root `onunloadDisableBeacon`
 alias supported only by runtime updates. `disableFetchTracking` and `disableAjaxTracking` are also
 runtime-only and are not accepted by the loader or its generated initialization `cfg`.
+`configSync` is also npm startup-only and is not accepted by the loader or generated configuration.
 The generated configuration's `cfg` holds initialization options; `instrumentationOptions` and
 `resourceAttributes` are siblings of `cfg`. See [Packaging](packaging.md#cdn-and-loader-snippet) for
 the snippet, CSP, fallback hosts, integrity manifests and failure handling.

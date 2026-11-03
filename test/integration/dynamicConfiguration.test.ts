@@ -3,6 +3,7 @@
 
 import { ROOT_CONTEXT, context, diag, propagation, trace } from "@opentelemetry/api";
 import { logs } from "@opentelemetry/api-logs";
+import { FetchInstrumentation } from "@opentelemetry/browser-instrumentation/experimental/fetch";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { afterEach, beforeEach, expect, inject, it, vi } from "vitest";
 import {
@@ -815,4 +816,179 @@ it("rejects queued and future updates once shutdown starts", async () => {
   expect((await queued).map((result) => result.status)).toEqual(["rejected", "rejected"]);
   await shutdown;
   await expect(pipeline.handle.updateCfg({ samplingPercentage: 100 })).rejects.toThrow("stopped");
+});
+
+function syncHandle(pipeline: Awaited<ReturnType<typeof start>>) {
+  expect(pipeline.handle.configSync).toBeDefined();
+  return pipeline.handle.configSync!;
+}
+
+function dispatchConfiguration(name: string, cfg: object): void {
+  globalThis.dispatchEvent(new CustomEvent(name, { detail: { cfg } }));
+}
+
+it("keeps default instances isolated until synchronization is explicitly configured", async () => {
+  const publisher = await start({ samplingPercentage: 100 });
+  const receiver = await start({ samplingPercentage: 100 });
+  expect(publisher.handle.configSync).toBeUndefined();
+  expect(receiver.handle.configSync).toBeUndefined();
+
+  await publisher.handle.updateCfg({ samplingPercentage: 0 });
+  emit(receiver.client, "default-instance-remains-local");
+  await receiver.handle.forceFlush();
+  expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+    "default-instance-remains-local",
+  ]);
+});
+
+it("broadcasts only when requested and applies received sampling to cached clients", async () => {
+  const publisher = await start({
+    samplingPercentage: 100,
+    extensionConfig: { AppInsightsCfgSyncPlugin: { syncMode: 1 } },
+  });
+  const receiver = await start({
+    extensionConfig: { AppInsightsCfgSyncPlugin: {} },
+  });
+  const cached = receiver.client;
+
+  await publisher.handle.updateCfg({ samplingPercentage: 0 });
+  emit(cached, "not-yet-broadcast");
+  await receiver.handle.forceFlush();
+  expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+    "not-yet-broadcast",
+  ]);
+
+  await syncHandle(publisher).sync();
+  cached.tracer.startSpan("received-zero", {}, ROOT_CONTEXT).end();
+  await receiver.handle.forceFlush();
+  expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+    "not-yet-broadcast",
+  ]);
+});
+
+it("synchronizes an explicit undefined sampling reset without adopting a receiver startup value", async () => {
+  const publisher = await start({
+    samplingPercentage: 0,
+    extensionConfig: { AppInsightsCfgSyncPlugin: { syncMode: 1 } },
+  });
+  const protectedReceiver = await start({
+    samplingPercentage: 0,
+    extensionConfig: { AppInsightsCfgSyncPlugin: {} },
+  });
+  const receiver = await start({
+    extensionConfig: { AppInsightsCfgSyncPlugin: {} },
+  });
+
+  await publisher.handle.updateCfg({ samplingPercentage: 100 });
+  await syncHandle(publisher).sync();
+  emit(protectedReceiver.client, "startup-zero-is-private");
+  emit(receiver.client, "received-100-before-reset");
+  await Promise.all([protectedReceiver.handle.forceFlush(), receiver.handle.forceFlush()]);
+  expect(protectedReceiver.spanExporter.getFinishedSpans()).toEqual([]);
+  expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+    "received-100-before-reset",
+  ]);
+
+  await publisher.handle.updateCfg({ samplingPercentage: undefined });
+  await syncHandle(publisher).sync();
+  const parent = trace.setSpanContext(ROOT_CONTEXT, { ...createSpanContext(), traceFlags: 0 });
+  receiver.client.tracer.startSpan("reset-restores-parent-sampling", {}, parent).end();
+  receiver.client.tracer.startSpan("reset-keeps-root-sampling", {}, ROOT_CONTEXT).end();
+  await receiver.handle.forceFlush();
+  expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+    "received-100-before-reset",
+    "reset-keeps-root-sampling",
+  ]);
+});
+
+it("keeps all synchronized fields private after a local replacement", async () => {
+  const publisher = await start({
+    samplingPercentage: 0,
+    extensionConfig: { AppInsightsCfgSyncPlugin: { syncMode: 1 } },
+  });
+  const receiver = await start({
+    samplingPercentage: 100,
+    extensionConfig: { AppInsightsCfgSyncPlugin: {} },
+  });
+  await receiver.handle.updateCfg({}, false);
+  await syncHandle(publisher).sync();
+  emit(receiver.client, "replacement-locks-sampling");
+  await receiver.handle.forceFlush();
+  expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+    "replacement-locks-sampling",
+  ]);
+});
+
+it("uses a custom channel and honors nonOverrideConfigs for the three allowed fields", async () => {
+  const channel = `cfg-sync-${crypto.randomUUID()}`;
+  const publisher = await start({
+    samplingPercentage: 0,
+    extensionConfig: {
+      AppInsightsCfgSyncPlugin: {
+        syncMode: 1,
+        customEvtName: channel,
+        nonOverrideConfigs: { disableFetchTracking: true },
+      },
+    },
+  });
+  const receiver = await start({
+    samplingPercentage: 100,
+    extensionConfig: {
+      AppInsightsCfgSyncPlugin: {
+        customEvtName: channel,
+        nonOverrideConfigs: { samplingPercentage: true },
+      },
+    },
+  });
+  await publisher.handle.updateCfg({ disableFetchTracking: true, disableAjaxTracking: true });
+  await syncHandle(publisher).sync();
+  emit(receiver.client, "receiver-sampling-is-excluded");
+  await receiver.handle.forceFlush();
+  expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+    "receiver-sampling-is-excluded",
+  ]);
+});
+
+it("does not reopen an explicitly paused fetch instrumentation after a received gate update", async () => {
+  const channel = `cfg-sync-${crypto.randomUUID()}`;
+  const receiver = await start({
+    extensionConfig: { AppInsightsCfgSyncPlugin: { customEvtName: channel } },
+    instrumentations: [new FetchInstrumentation({ enabled: false })],
+  });
+  await receiver.handle.instrumentations.setEnabled("fetch", false);
+  dispatchConfiguration(channel, { disableFetchTracking: true });
+  dispatchConfiguration(channel, { disableFetchTracking: false });
+  await vi.waitFor(async () => {
+    await receiver.handle.forceFlush();
+    expect(receiver.spanExporter.getFinishedSpans()).toEqual([]);
+  });
+  await fetch("data:text/plain,config-sync-manual-pause");
+  await receiver.handle.forceFlush();
+  expect(receiver.spanExporter.getFinishedSpans()).toEqual([]);
+});
+
+it("isolates malformed events, removes listeners on shutdown, and preserves other receivers", async () => {
+  const channel = `cfg-sync-${crypto.randomUUID()}`;
+  const errors = vi.fn();
+  const first = await start({
+    extensionConfig: { AppInsightsCfgSyncPlugin: { customEvtName: channel, onError: errors } },
+  });
+  const second = await start({
+    extensionConfig: { AppInsightsCfgSyncPlugin: { customEvtName: channel } },
+  });
+  const malformed = Object.defineProperty({}, "samplingPercentage", {
+    get: () => 0,
+  });
+  dispatchConfiguration(channel, malformed);
+  await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1));
+  dispatchConfiguration(channel, { samplingPercentage: 0 });
+  await second.handle.updateCfg({});
+  second.client.tracer.startSpan("second-received-after-error", {}, ROOT_CONTEXT).end();
+  await second.handle.forceFlush();
+  expect(second.spanExporter.getFinishedSpans()).toEqual([]);
+
+  await first.handle.shutdown();
+  dispatchConfiguration(channel, { samplingPercentage: 100 });
+  first.client.tracer.startSpan("shutdown-receiver-stays-stopped", {}, ROOT_CONTEXT).end();
+  expect(first.spanExporter.getFinishedSpans()).toEqual([]);
 });

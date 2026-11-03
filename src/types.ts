@@ -147,11 +147,45 @@ export interface MicrosoftOpenTelemetryBrowserSessionOptions {
   maxDuration?: number;
 }
 
+/** Startup-only same-realm event synchronization. No HTTP, storage or cross-tab transport.
+ * @public
+ */
+export interface MicrosoftOpenTelemetryBrowserConfigurationSyncOptions {
+  /** 0: off, 1: broadcast only, 2: receive only (default after explicit opt-in). */
+  readonly syncMode?: 0 | 1 | 2;
+  /** Same-realm CustomEvent channel. Defaults to ai_cfgsync; not an authentication boundary. */
+  readonly customEvtName?: string;
+  /** Prevent synchronization of selected allowlisted root fields. False cannot widen the allowlist. */
+  readonly nonOverrideConfigs?: Readonly<
+    Partial<Record<"samplingPercentage" | "disableFetchTracking" | "disableAjaxTracking", boolean>>
+  >;
+  /** Receives validation or asynchronous receive failures. Thrown/rejected callbacks are isolated. */
+  readonly onError?: (error: unknown) => void;
+}
+
+/** Lifecycle controls for an explicitly configured same-realm event adapter.
+ * @public
+ */
+export interface MicrosoftOpenTelemetryBrowserConfigurationSync {
+  /** Explicitly broadcasts the allowed current snapshot in mode 1. Dispatch is not receiver acknowledgement. */
+  sync(): Promise<void>;
+  /** Stops listening/publishing and invalidates queued delivery without reverting committed values. */
+  pause(): void;
+  /** Resumes observation without replay. No effect after shutdown. */
+  resume(): void;
+  /** Permanently removes this adapter's listener. Telemetry shutdown also calls this. */
+  shutdown(): void;
+}
+
 /**
  * Microsoft browser distribution configuration for traces and logs.
  * @public
  */
 export interface MicrosoftOpenTelemetryBrowserOptions {
+  /** Explicit opt-in; absent configuration installs no synchronization adapter or listener. */
+  extensionConfig?: {
+    AppInsightsCfgSyncPlugin?: MicrosoftOpenTelemetryBrowserConfigurationSyncOptions;
+  };
   /** Application Insights inactivity lifetime in milliseconds. Zero restores 30 minutes. */
   sessionRenewalMs?: number | undefined;
   /** Application Insights maximum session lifetime in milliseconds. Zero restores 24 hours. */
@@ -359,6 +393,8 @@ export interface MicrosoftOpenTelemetryBrowserInstrumentations {
  * @public
  */
 export interface MicrosoftOpenTelemetryBrowser {
+  /** Present only after explicit configuration of AppInsightsCfgSyncPlugin. */
+  readonly configSync?: MicrosoftOpenTelemetryBrowserConfigurationSync;
   /** Instance-local controls for already registered instrumentations. Startup remains automatic. */
   readonly instrumentations: MicrosoftOpenTelemetryBrowserInstrumentations;
   /**

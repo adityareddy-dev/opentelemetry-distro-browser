@@ -23,6 +23,10 @@ import { PageViewCorrelation } from "./instrumentation/pageView/pageViewCorrelat
 import { createInstrumentationRegistry } from "./instrumentation/instrumentationRegistry.js";
 import { createRuntimeConfiguration } from "./configuration/runtimeConfiguration.js";
 import {
+  captureConfigurationSync,
+  createConfigurationSync,
+} from "./configuration/configurationSync.js";
+import {
   ATTR_TELEMETRY_DISTRO_NAME,
   ATTR_TELEMETRY_DISTRO_VERSION,
 } from "@opentelemetry/semantic-conventions";
@@ -166,7 +170,9 @@ export async function useMicrosoftOpenTelemetry(
   options: MicrosoftOpenTelemetryBrowserOptions = {},
 ): Promise<MicrosoftOpenTelemetryBrowser> {
   const sdkStats = snapshotSdkStatsOptions(options.azureMonitor?.sdkStats);
+  const syncOptions = captureConfigurationSync(options.extensionConfig);
   let stopping = false;
+  let configSync: MicrosoftOpenTelemetryBrowser["configSync"];
   let instrumentationRegistry: ReturnType<typeof createInstrumentationRegistry> | undefined;
   const sessionOptions = options.session;
   const inactivityTimeout = sessionOptions?.inactivityTimeout;
@@ -179,9 +185,10 @@ export async function useMicrosoftOpenTelemetry(
         sdkStats,
       }
     : undefined;
+  const samplingPercentage = options.samplingPercentage;
   const configuration = createRuntimeConfiguration(
     {
-      samplingPercentage: options.samplingPercentage,
+      samplingPercentage,
       session: {
         ...((inactivityTimeout !== undefined ||
           (sessionOptions && Object.hasOwn(sessionOptions, "inactivityTimeout"))) && {
@@ -205,6 +212,7 @@ export async function useMicrosoftOpenTelemetry(
       return stopping;
     },
     (next) => instrumentationRegistry?.setNetworkGates(next),
+    samplingPercentage !== undefined || Object.hasOwn(options, "samplingPercentage"),
   );
   const redactedQueryParams: readonly string[] = [
     ...DEFAULT_QUERY_STRINGS_TO_REDACT,
@@ -349,6 +357,7 @@ export async function useMicrosoftOpenTelemetry(
       stopping = true;
       const errors: unknown[] = [];
       for (const cleanup of [
+        () => configSync?.shutdown(),
         () => {
           if (!initialized) pageViewInstrumentation?.rollbackStartup();
         },
@@ -455,7 +464,7 @@ export async function useMicrosoftOpenTelemetry(
   try {
     // Reserve before construction or callbacks can re-enter startup, with rollback already armed.
     const owned = createOwnedInstrumentations(
-      { ...options, pageView, azureMonitor },
+      { pageView, azureMonitor, storage: options.storage, traces: options.traces },
       () => getPageOperation(correlationState.current),
       () => readSamplingPercentage() ?? 100,
       (namespace) => {
@@ -554,6 +563,12 @@ export async function useMicrosoftOpenTelemetry(
     );
     removeUnloadSubscription = subscribeToUnload(flushForUnload);
     instrumentationRegistry.enable();
+    if (syncOptions) {
+      const adapter = createConfigurationSync(syncOptions, configuration);
+      configSync = adapter.handle;
+      Object.defineProperty(handle, "configSync", { value: configSync, enumerable: true });
+      adapter.start();
+    }
     instance.commit();
     initialized = true;
     pageViewInstrumentation?.commitStartup();

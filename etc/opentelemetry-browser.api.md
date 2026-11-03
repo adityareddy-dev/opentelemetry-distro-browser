@@ -78,11 +78,28 @@ export interface BrowserInstrumentation {
 
 // @public
 export interface MicrosoftOpenTelemetryBrowser {
+    readonly configSync?: MicrosoftOpenTelemetryBrowserConfigurationSync;
     forceFlush(): Promise<void>;
     readonly instrumentations: MicrosoftOpenTelemetryBrowserInstrumentations;
     shutdown(): Promise<void>;
     updateCfg(patch: MicrosoftOpenTelemetryBrowserConfigurationUpdate, mergeExisting?: boolean): Promise<MicrosoftOpenTelemetryBrowserConfigurationUpdateResult>;
     readonly userContext: MicrosoftOpenTelemetryBrowserUserContext;
+}
+
+// @public
+export interface MicrosoftOpenTelemetryBrowserConfigurationSync {
+    pause(): void;
+    resume(): void;
+    shutdown(): void;
+    sync(): Promise<void>;
+}
+
+// @public
+export interface MicrosoftOpenTelemetryBrowserConfigurationSyncOptions {
+    readonly customEvtName?: string;
+    readonly nonOverrideConfigs?: Readonly<Partial<Record<"samplingPercentage" | "disableFetchTracking" | "disableAjaxTracking", boolean>>>;
+    readonly onError?: (error: unknown) => void;
+    readonly syncMode?: 0 | 1 | 2;
 }
 
 // @public
@@ -122,6 +139,9 @@ export interface MicrosoftOpenTelemetryBrowserInstrumentations {
 // @public
 export interface MicrosoftOpenTelemetryBrowserOptions {
     azureMonitor?: AzureMonitorOptions<string | Promise<string>>;
+    extensionConfig?: {
+        AppInsightsCfgSyncPlugin?: MicrosoftOpenTelemetryBrowserConfigurationSyncOptions;
+    };
     instrumentations?: readonly BrowserInstrumentation[];
     logRecordProcessors?: LogRecordProcessor[];
     pageView?: PageViewInstrumentationConfig;

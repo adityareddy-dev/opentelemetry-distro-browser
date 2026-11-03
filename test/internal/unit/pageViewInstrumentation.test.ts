@@ -504,15 +504,23 @@ describe("PageViewInstrumentation", () => {
       const { instrumentation, provider } = createInstrumentation();
 
       instrumentation.enable();
-      await settle();
+      await vi.waitFor(() => {
+        expect(
+          provider.records.map((record) => attributesOf(record)[ATTR_PAGE_VIEW_INDEX]),
+        ).toEqual([0]);
+      });
       history.pushState(null, "", "/step-1");
-      await settle();
+      await vi.waitFor(() => {
+        expect(
+          provider.records.map((record) => attributesOf(record)[ATTR_PAGE_VIEW_INDEX]),
+        ).toEqual([0, 1]);
+      });
       history.pushState(null, "", "/step-2");
-      await settle();
-
-      expect(provider.records.map((record) => attributesOf(record)[ATTR_PAGE_VIEW_INDEX])).toEqual([
-        0, 1, 2,
-      ]);
+      await vi.waitFor(() => {
+        expect(
+          provider.records.map((record) => attributesOf(record)[ATTR_PAGE_VIEW_INDEX]),
+        ).toEqual([0, 1, 2]);
+      });
     });
 
     it("records the previous in-document URL as the referrer", async () => {

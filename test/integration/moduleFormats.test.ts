@@ -1,12 +1,25 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-import type { ContextAPI, DiagAPI, PropagationAPI, TraceAPI } from "@opentelemetry/api";
-import type { LoggerProvider } from "@opentelemetry/api-logs";
+import {
+  ROOT_CONTEXT,
+  context,
+  diag,
+  propagation,
+  trace,
+  type ContextAPI,
+  type DiagAPI,
+  type PropagationAPI,
+  type TraceAPI,
+  type Tracer,
+} from "@opentelemetry/api";
+import { logs, type LoggerProvider } from "@opentelemetry/api-logs";
+import { resourceFromAttributes } from "@opentelemetry/resources";
 import { expect, inject, it, vi } from "vitest";
-import type {
-  MicrosoftOpenTelemetryBrowser,
-  MicrosoftOpenTelemetryBrowserOptions,
+import {
+  useMicrosoftOpenTelemetry,
+  type MicrosoftOpenTelemetryBrowser,
+  type MicrosoftOpenTelemetryBrowserOptions,
 } from "../../src/index.js";
 import type {
   BrowserInstrumentation,
@@ -196,6 +209,143 @@ it.each(["opentelemetry-browser.umd.js", "opentelemetry-browser.umd.min.js"])(
     } finally {
       script?.remove();
       restoreDefine();
+    }
+  },
+);
+
+it.each(["source", "bundle"] as const)(
+  "synchronizes sampling from the %s publisher across source and minified IIFE copies",
+  async (publisherCopy) => {
+    const restoreDefine = preserveAmdDefine();
+    const microsoft = Object.getOwnPropertyDescriptor(window, "Microsoft");
+    delete window.define;
+    delete window.Microsoft;
+    const channel = `module-format-sync-${crypto.randomUUID()}`;
+    const events: Event[] = [];
+    const observe = (event: Event) => events.push(event);
+    const handles: MicrosoftOpenTelemetryBrowser[] = [];
+    let script: HTMLScriptElement | undefined;
+    let bundle: BrowserBundle | undefined;
+    globalThis.addEventListener(channel, observe);
+    try {
+      script = await loadScript("opentelemetry-browser.iife.min.js");
+      bundle = getBrowserBundle();
+      if (!bundle) throw new Error("The minified IIFE bundle did not load");
+      const publisherInit =
+        publisherCopy === "source" ? useMicrosoftOpenTelemetry : bundle.useMicrosoftOpenTelemetry;
+      const receiverInit =
+        publisherCopy === "source" ? bundle.useMicrosoftOpenTelemetry : useMicrosoftOpenTelemetry;
+
+      async function start(
+        initialize: typeof useMicrosoftOpenTelemetry,
+        role: "publisher" | "receiver",
+      ) {
+        const pipeline = createInMemoryPipeline();
+        let tracer!: Tracer;
+        const handle = await initialize({
+          ...pipeline.options,
+          resource: resourceFromAttributes({ "service.name": `sync-${role}` }),
+          pageView: { enabled: false },
+          session: { enabled: false },
+          userContext: { enabled: false },
+          ...(role === "publisher" ? { samplingPercentage: 0 } : {}),
+          extensionConfig: {
+            AppInsightsCfgSyncPlugin: {
+              ...(role === "publisher" ? { syncMode: 1 as const } : {}),
+              customEvtName: channel,
+            },
+          },
+          instrumentations: [
+            {
+              setTracerProvider(provider) {
+                tracer = provider.getTracer("sync-bundle");
+              },
+              getConfig: () => ({ enabled: true }),
+              enable() {},
+              disable() {},
+            },
+          ],
+        });
+        handles.push(handle);
+        expect(tracer).toBeDefined();
+        return { ...pipeline, handle, tracer };
+      }
+
+      const publisher = await start(publisherInit, "publisher");
+      const receiver = await start(receiverInit, "receiver");
+      const publisherSync = publisher.handle.configSync;
+      const receiverSync = receiver.handle.configSync;
+      if (!publisherSync || !receiverSync) throw new Error("Configuration sync was not enabled");
+
+      await publisher.handle.updateCfg({ disableFetchTracking: true, disableAjaxTracking: true });
+      receiver.tracer.startSpan("before-publish", {}, ROOT_CONTEXT).end();
+      await receiver.handle.forceFlush();
+      expect(events).toHaveLength(0);
+      expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+        "before-publish",
+      ]);
+
+      await publisherSync.sync();
+      await receiver.handle.updateCfg({}); // Wait for the receiver's queued event update.
+      expect(events).toHaveLength(1);
+      expect(events[0]).toBeInstanceOf(CustomEvent);
+      const detail = (events[0] as CustomEvent<{ cfg: Record<string, unknown> }>).detail;
+      expect(detail.cfg).toEqual({
+        samplingPercentage: 0,
+        disableFetchTracking: true,
+        disableAjaxTracking: true,
+      });
+      receiver.tracer.startSpan("received-zero", {}, ROOT_CONTEXT).end();
+      await receiver.handle.forceFlush();
+      expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+        "before-publish",
+      ]);
+
+      receiverSync.pause();
+      await publisher.handle.updateCfg({ samplingPercentage: 100 });
+      expect(events).toHaveLength(1);
+      await publisherSync.sync();
+      await receiver.handle.updateCfg({});
+      receiverSync.resume();
+      receiver.tracer.startSpan("paused-delivery", {}, ROOT_CONTEXT).end();
+      await receiver.handle.forceFlush();
+      expect(events).toHaveLength(2);
+      expect(receiver.spanExporter.getFinishedSpans().map((span) => span.name)).toEqual([
+        "before-publish",
+      ]);
+
+      await publisherSync.sync();
+      await receiver.handle.updateCfg({});
+      receiver.tracer.startSpan("received-100", {}, ROOT_CONTEXT).end();
+      publisher.tracer.startSpan("publisher-100", {}, ROOT_CONTEXT).end();
+      await Promise.all([publisher.handle.forceFlush(), receiver.handle.forceFlush()]);
+      expect(events).toHaveLength(3);
+      const receiverSpans = receiver.spanExporter.getFinishedSpans();
+      const publisherSpans = publisher.spanExporter.getFinishedSpans();
+      expect(receiverSpans.map((span) => span.name)).toEqual(["before-publish", "received-100"]);
+      expect(publisherSpans.map((span) => span.name)).toEqual(["publisher-100"]);
+      expect(receiverSpans.map((span) => span.resource.attributes["service.name"])).toEqual([
+        "sync-receiver",
+        "sync-receiver",
+      ]);
+      expect(publisherSpans[0]?.resource.attributes["service.name"]).toBe("sync-publisher");
+    } finally {
+      try {
+        await Promise.all(handles.map((handle) => handle.shutdown()));
+      } finally {
+        globalThis.removeEventListener(channel, observe);
+        for (const api of [bundle, { trace, logs, propagation, context, diag }]) {
+          api?.trace.disable();
+          api?.logs.disable();
+          api?.propagation.disable();
+          api?.context.disable();
+          api?.diag.disable();
+        }
+        script?.remove();
+        if (microsoft) Object.defineProperty(window, "Microsoft", microsoft);
+        else delete window.Microsoft;
+        restoreDefine();
+      }
     }
   },
 );

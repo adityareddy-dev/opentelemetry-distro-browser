@@ -5,6 +5,8 @@ import {
   useMicrosoftOpenTelemetry,
   type AzureMonitorOptions,
   type MicrosoftOpenTelemetryBrowser,
+  type MicrosoftOpenTelemetryBrowserConfigurationSync,
+  type MicrosoftOpenTelemetryBrowserConfigurationSyncOptions,
   type MicrosoftOpenTelemetryBrowserConfigurationUpdate,
   type MicrosoftOpenTelemetryBrowserInstrumentations,
   type MicrosoftOpenTelemetryBrowserOptions,
@@ -27,6 +29,37 @@ const asynchronousOptions: AzureMonitorOptions<Promise<string>> = {
 };
 useMicrosoftOpenTelemetry({ azureMonitor: options });
 useMicrosoftOpenTelemetry({ azureMonitor: asynchronousOptions });
+const syncOptions: MicrosoftOpenTelemetryBrowserConfigurationSyncOptions = {
+  syncMode: 2,
+  nonOverrideConfigs: { disableAjaxTracking: true },
+};
+useMicrosoftOpenTelemetry({ extensionConfig: { AppInsightsCfgSyncPlugin: syncOptions } });
+useMicrosoftOpenTelemetry({ extensionConfig: { AppInsightsCfgSyncPlugin: { syncMode: 0 } } });
+// @ts-expect-error Synchronization modes are numeric, not strings.
+const invalidSyncMode: MicrosoftOpenTelemetryBrowserConfigurationSyncOptions = { syncMode: "1" };
+const invalidSyncExclusion: MicrosoftOpenTelemetryBrowserConfigurationSyncOptions = {
+  // @ts-expect-error User configuration is not synchronizable.
+  nonOverrideConfigs: { user: true },
+};
+void invalidSyncMode;
+void invalidSyncExclusion;
+
+export function controlConfigSync(handle: MicrosoftOpenTelemetryBrowser): void {
+  if (handle.configSync) {
+    const controls: MicrosoftOpenTelemetryBrowserConfigurationSync = handle.configSync;
+    const synced: Promise<void> = controls.sync();
+    const paused: void = controls.pause();
+    const resumed: void = controls.resume();
+    const stopped: void = controls.shutdown();
+    void [synced, paused, resumed, stopped];
+    // @ts-expect-error Configuration synchronization controls are readonly on the handle.
+    handle.configSync = controls;
+  }
+  if (syncOptions.nonOverrideConfigs) {
+    // @ts-expect-error Exclusions are readonly.
+    syncOptions.nonOverrideConfigs.disableAjaxTracking = false;
+  }
+}
 const connectionString = options.connectionString;
 useMicrosoftOpenTelemetry({ azureMonitor: { connectionString, disableBeacon: true } });
 // @ts-expect-error Network tracking gates are runtime-only.

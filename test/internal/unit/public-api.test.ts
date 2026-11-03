@@ -16,6 +16,8 @@ import {
   type BrowserInstrumentation,
   type MicrosoftOpenTelemetryBrowser,
   type MicrosoftOpenTelemetryBrowserConfigurationUpdate,
+  type MicrosoftOpenTelemetryBrowserConfigurationSync,
+  type MicrosoftOpenTelemetryBrowserConfigurationSyncOptions,
   type MicrosoftOpenTelemetryBrowserConfigurationUpdateResult,
   type MicrosoftOpenTelemetryBrowserInstrumentations,
   type MicrosoftOpenTelemetryBrowserOptions,
@@ -47,6 +49,7 @@ it("exposes distro-owned configuration and lifecycle contracts", () => {
     | "userContext"
     | "traces"
     | "redactQueryParams"
+    | "extensionConfig"
   >();
   expectTypeOf<MicrosoftOpenTelemetryBrowserOptions["redactQueryParams"]>().toEqualTypeOf<
     readonly string[] | undefined
@@ -129,6 +132,15 @@ it("exposes distro-owned configuration and lifecycle contracts", () => {
   >();
   expectTypeOf<Instrumentation>().toExtend<BrowserInstrumentation>();
   expectTypeOf<MicrosoftOpenTelemetryBrowser["forceFlush"]>().toEqualTypeOf<() => Promise<void>>();
+  expectTypeOf<MicrosoftOpenTelemetryBrowser["configSync"]>().toEqualTypeOf<
+    MicrosoftOpenTelemetryBrowserConfigurationSync | undefined
+  >();
+  expectTypeOf<MicrosoftOpenTelemetryBrowserConfigurationSyncOptions["syncMode"]>().toEqualTypeOf<
+    0 | 1 | 2 | undefined
+  >();
+  expectTypeOf<MicrosoftOpenTelemetryBrowserConfigurationSync["sync"]>().toEqualTypeOf<
+    () => Promise<void>
+  >();
   expectTypeOf<
     MicrosoftOpenTelemetryBrowser["instrumentations"]
   >().toEqualTypeOf<MicrosoftOpenTelemetryBrowserInstrumentations>();
@@ -157,7 +169,7 @@ it("exposes distro-owned configuration and lifecycle contracts", () => {
 
 it("exposes sampling, session lifetime and unload beacon runtime updates", () => {
   expectTypeOf<keyof MicrosoftOpenTelemetryBrowser>().toEqualTypeOf<
-    "updateCfg" | "instrumentations" | "userContext" | "forceFlush" | "shutdown"
+    "updateCfg" | "instrumentations" | "userContext" | "forceFlush" | "shutdown" | "configSync"
   >();
   expectTypeOf<keyof MicrosoftOpenTelemetryBrowserConfigurationUpdate>().toEqualTypeOf<
     | "samplingPercentage"

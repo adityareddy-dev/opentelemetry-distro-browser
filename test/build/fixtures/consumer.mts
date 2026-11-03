@@ -6,6 +6,8 @@ import {
   type AzureMonitorOptions,
   type BrowserInstrumentation,
   type MicrosoftOpenTelemetryBrowser,
+  type MicrosoftOpenTelemetryBrowserConfigurationSync,
+  type MicrosoftOpenTelemetryBrowserConfigurationSyncOptions,
   type MicrosoftOpenTelemetryBrowserConfigurationUpdate,
   type MicrosoftOpenTelemetryBrowserInstrumentations,
   type MicrosoftOpenTelemetryBrowserOptions,
@@ -120,6 +122,46 @@ useMicrosoftOpenTelemetry({ azureMonitor: { connectionString, sdkStats: {} } });
 export const initialize: (
   config: MicrosoftOpenTelemetryBrowserOptions,
 ) => Promise<MicrosoftOpenTelemetryBrowser> = useMicrosoftOpenTelemetry;
+const syncOptions: MicrosoftOpenTelemetryBrowserConfigurationSyncOptions = {
+  syncMode: 1,
+  customEvtName: "consumer-config",
+  nonOverrideConfigs: { samplingPercentage: true, disableFetchTracking: false },
+  onError: (error): void => {
+    const cause: unknown = error;
+    // @ts-expect-error Error callbacks receive an unknown value.
+    const message: string = error;
+    void cause;
+    void message;
+  },
+};
+useMicrosoftOpenTelemetry({ extensionConfig: { AppInsightsCfgSyncPlugin: {} } });
+useMicrosoftOpenTelemetry({ extensionConfig: { AppInsightsCfgSyncPlugin: syncOptions } });
+// @ts-expect-error Only the three event synchronization modes are supported.
+const invalidSyncMode: MicrosoftOpenTelemetryBrowserConfigurationSyncOptions = { syncMode: 3 };
+const invalidSyncUrl: MicrosoftOpenTelemetryBrowserConfigurationSyncOptions = {
+  // @ts-expect-error HTTP configuration is not supported.
+  cfgUrl: "https://example.test",
+};
+const invalidSyncExclusion: MicrosoftOpenTelemetryBrowserConfigurationSyncOptions = {
+  // @ts-expect-error Resource configuration is not synchronizable.
+  nonOverrideConfigs: { resource: true },
+};
+void invalidSyncMode;
+void invalidSyncUrl;
+void invalidSyncExclusion;
+
+export function controlConfigSync(handle: MicrosoftOpenTelemetryBrowser): void {
+  if (handle.configSync) {
+    const controls: MicrosoftOpenTelemetryBrowserConfigurationSync = handle.configSync;
+    const synced: Promise<void> = controls.sync();
+    const paused: void = controls.pause();
+    const resumed: void = controls.resume();
+    const stopped: void = controls.shutdown();
+    void [synced, paused, resumed, stopped];
+    // @ts-expect-error Configuration synchronization controls are readonly on the handle.
+    handle.configSync = controls;
+  }
+}
 // @ts-expect-error The previous distribution-specific option is no longer supported.
 useMicrosoftOpenTelemetry({ samplingRatio: 1 });
 // @ts-expect-error Service configuration goes through the resource option, not serviceName.
