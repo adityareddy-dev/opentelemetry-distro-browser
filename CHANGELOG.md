@@ -6,6 +6,13 @@ All notable changes to this package are documented in this file.
 
 ### Added
 
+- Add explicit `next/otel/` and `scripts/otel/` CDN destinations while preserving immutable
+  full-version beta filenames and legacy routing.
+- Add major-only CDN auto-update aliases for SDK and instrumentation bundles, source maps, size
+  badges, and integrity metadata. Activate next aliases after successful publication; activate
+  public aliases only on explicit promotion, including storage-only promotion. Use 30-minute
+  alias caching and renewable storage leases to serialize each destination/container/major set,
+  with bounded subprocess cancellation; multi-file reads remain non-atomic.
 - Add opt-in same-realm configuration synchronization through
   `extensionConfig.AppInsightsCfgSyncPlugin`. Support explicit broadcast-only and receive-only
   modes for sampling and fetch/XHR gates, with local precedence, pause/resume/shutdown controls, and
@@ -55,6 +62,7 @@ false` blocks SDK-managed storage access, including later identity-control calls
 
 ### Changed
 
+- Use the selected release version consistently for CDN verification and its success output.
 - Require Node.js 22.23.4+, 24.22.1+, or 26.12.1+ for repository tooling to address
   CVE-2026-111497. Enforce patched minimums in CI and installs, and reject unsupported
   runtimes before CDN verification/publishing and performance network operations.

@@ -6,10 +6,11 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { readFileSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
-import { resolve } from "node:path";
+import { delimiter, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import {
   aliasCacheControl,
@@ -24,10 +25,109 @@ import {
   readCdnFile,
   root,
 } from "../../scripts/cdn.mjs";
-import { activateCdnAliases, publishCdn } from "../../scripts/publish-cdn.mjs";
+import { activateCdnAliases, publishCdn, runAzureCli } from "../../scripts/publish-cdn.mjs";
 import { verifyCdn } from "../../scripts/verify-cdn.mjs";
 
 const md5 = (bytes) => createHash("md5").update(bytes).digest("base64");
+
+async function azureCliFixture(t, sideEffectDelay) {
+  const directory = await mkdtemp(resolve(tmpdir(), "otel-azure-cli-test-"));
+  const ready = resolve(directory, "ready.json");
+  const uploaded = resolve(directory, "uploaded");
+  const worker = resolve(directory, "worker.cjs");
+  const launcher = resolve(directory, "launcher.cjs");
+  await writeFile(
+    worker,
+    `const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(`${ready}.tmp`)}, JSON.stringify({ pid: process.pid }));
+fs.renameSync(${JSON.stringify(`${ready}.tmp`)}, ${JSON.stringify(ready)});
+setTimeout(() => fs.writeFileSync(${JSON.stringify(uploaded)}, "uploaded"), ${sideEffectDelay});
+setInterval(() => {}, 1000);
+`,
+  );
+  await writeFile(
+    launcher,
+    `require("node:child_process").spawn(process.execPath, [${JSON.stringify(worker)}], { stdio: "inherit" });
+`,
+  );
+  const windows = process.platform === "win32";
+  const executable = resolve(directory, windows ? "az.cmd" : "az");
+  await writeFile(
+    executable,
+    windows
+      ? `@echo off\r\n"${process.execPath}" "${launcher}"\r\n`
+      : `#!/bin/sh\n"${process.execPath}" "${launcher}"\n`,
+  );
+  if (!windows) await chmod(executable, 0o755);
+  const path = process.env.PATH;
+  process.env.PATH = `${directory}${delimiter}${path}`;
+  let pid;
+  t.after(async () => {
+    process.env.PATH = path;
+    if (pid) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    await rm(directory, { recursive: true, force: true });
+  });
+  return {
+    uploaded,
+    markStopped() {
+      pid = undefined;
+    },
+    async waitForWorker() {
+      const deadline = performance.now() + 5_000;
+      while (performance.now() < deadline) {
+        try {
+          pid = JSON.parse(await readFile(ready, "utf8")).pid;
+          return;
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        await delay(10);
+      }
+      assert.fail("Azure CLI wrapper did not start its descendant.");
+    },
+  };
+}
+
+test(
+  "Azure CLI cancellation stops a real non-exec wrapper and its uploading descendant",
+  { timeout: 10_000 },
+  async (t) => {
+    const fixture = await azureCliFixture(t, 600);
+    const controller = new AbortController();
+    const cancelled = new Error("Lease renewal failed.");
+    const result = runAzureCli(["fixture"], { signal: controller.signal }).catch((error) => error);
+    await fixture.waitForWorker();
+    const start = performance.now();
+    controller.abort(cancelled);
+    assert.equal(await result, cancelled);
+    fixture.markStopped();
+    assert.ok(performance.now() - start < 2_000, "inherited pipes must not delay cancellation");
+    await delay(800);
+    await assert.rejects(readFile(fixture.uploaded), { code: "ENOENT" });
+  },
+);
+
+test(
+  "Azure CLI timeout stops a real non-exec wrapper and its uploading descendant",
+  { timeout: 10_000 },
+  async (t) => {
+    const fixture = await azureCliFixture(t, 4_000);
+    const start = performance.now();
+    const result = runAzureCli(["fixture"], { timeoutMs: 2_000 }).catch((error) => error);
+    await fixture.waitForWorker();
+    assert.match((await result).message, /Azure CLI timed out after 2000 ms/);
+    fixture.markStopped();
+    assert.ok(performance.now() - start < 3_500, "inherited pipes must not defeat the timeout");
+    await delay(4_200);
+    await assert.rejects(readFile(fixture.uploaded), { code: "ENOENT" });
+  },
+);
 
 async function release(t, version) {
   const directory = await mkdtemp(resolve(tmpdir(), "otel-alias-test-"));

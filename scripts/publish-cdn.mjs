@@ -38,7 +38,10 @@ AZURE_STORAGE_SAS_TOKEN is set.`;
 
 const quote = (value) => (/^[\w./:=@-]+$/.test(value) ? value : `"${value.replace(/"/g, '\\"')}"`);
 
-function az(args, { signal } = {}) {
+export function runAzureCli(args, { signal, timeoutMs = 30_000 } = {}) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 30_000) {
+    throw new Error("Azure CLI timeout must be between 0 and 30000 ms.");
+  }
   // `az` is a batch file on Windows, which Node only starts through a shell.
   const windows = process.platform === "win32";
   return new Promise((resolve, reject) => {
@@ -46,6 +49,7 @@ function az(args, { signal } = {}) {
     const child = spawn("az", windows ? args.map(quote) : args, {
       shell: windows,
       windowsHide: true,
+      detached: !windows,
     });
     let stdout = "";
     let stderr = "";
@@ -80,13 +84,25 @@ function az(args, { signal } = {}) {
             done();
           });
         });
-      } else child.kill("SIGKILL");
+      } else if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch (error) {
+          if (error.code !== "ESRCH") {
+            failure = new AggregateError(
+              [failure, error],
+              "Unable to stop Azure CLI process group.",
+            );
+            child.kill("SIGKILL");
+          }
+        }
+      }
     };
     const abort = () => terminate(signal.reason);
     signal?.addEventListener("abort", abort, { once: true });
     const timeout = setTimeout(
-      () => terminate(new Error("Azure CLI timed out after 30 seconds.")),
-      30_000,
+      () => terminate(new Error(`Azure CLI timed out after ${timeoutMs} ms.`)),
+      timeoutMs,
     );
     child.stdout.setEncoding("utf8").on("data", (data) => {
       stdout += data;
@@ -270,7 +286,7 @@ export async function publishCdn({
   destination,
   directory = cdnDirectory,
   dryRun = false,
-  run = az,
+  run = runAzureCli,
   verify = verifyCdn,
   activate = activateCdnAliases,
   log = (line) => process.stdout.write(`${line}\n`),
@@ -386,7 +402,7 @@ export async function activateCdnAliases({
   directory = cdnDirectory,
   fromStorage = false,
   dryRun = false,
-  run = az,
+  run = runAzureCli,
   verify = verifyCdn,
   renewalIntervalMs = 15_000,
   log = (line) => process.stdout.write(`${line}\n`),
