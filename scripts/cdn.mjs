@@ -11,6 +11,7 @@ export const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const cdnOrigin = "https://js.monitor.azure.com";
 export const cdnDirectory = resolve(root, "cdn");
 export const cacheControl = "public, max-age=31536000, immutable, no-transform";
+export const aliasCacheControl = "public, max-age=1800, no-transform";
 
 export const modules = ["opentelemetry-browser", "opentelemetry-browser-instrumentations"];
 // Source format in dist/browser -> CDN format. The IIFE is the default because the loader snippet
@@ -33,9 +34,17 @@ export function getCdnChannel(version) {
   return channel;
 }
 
-export const getCdnPath = (version) => `scripts/otel/${getCdnChannel(version)}`;
+/** Explicit destinations preserve the full release version; omission keeps legacy channel routing. */
+export function getCdnPath(version, destination) {
+  const channel = getCdnChannel(version);
+  if (destination === undefined) return `scripts/otel/${channel}`;
+  if (destination === "next") return "next/otel";
+  if (destination === "public") return "scripts/otel";
+  throw new Error(`Unsupported CDN destination ${destination}; expected next or public.`);
+}
 
-export const getCdnUrl = (version, file) => `${cdnOrigin}/${getCdnPath(version)}/${file}`;
+export const getCdnUrl = (version, file, destination) =>
+  `${cdnOrigin}/${getCdnPath(version, destination)}/${file}`;
 
 /** Lists each browser bundle in dist/browser with its versioned CDN file name. */
 export function getCdnArtifacts(version) {
@@ -47,6 +56,67 @@ export function getCdnArtifacts(version) {
       file: `${module}.${version}.${format}`,
     })),
   );
+}
+
+export function getCdnMajor(version) {
+  getCdnChannel(version);
+  return version.split(".")[0];
+}
+
+export function getCdnAliasUploads(version, destination) {
+  if (destination === undefined)
+    throw new Error("Major aliases require an explicit CDN destination.");
+  const major = getCdnMajor(version);
+  return getCdnUploads(version, destination).map((upload) => {
+    const file = upload.file.replace(`.${version}.`, `.${major}.`);
+    return {
+      ...upload,
+      file,
+      source: upload.file,
+      blob: `${getCdnPath(version, destination)}/${file}`,
+      url: getCdnUrl(version, file, destination),
+      cacheControl: aliasCacheControl,
+    };
+  });
+}
+
+/** Generates a consistent major-alias release from the prepared immutable files. */
+export async function prepareCdnAliases(version, directory, destination) {
+  const uploads = getCdnAliasUploads(version, destination);
+  const files = new Map();
+  const major = getCdnMajor(version);
+  const integrityFiles = new Map();
+  for (const artifact of getCdnArtifacts(version)) {
+    const file = artifact.file.replace(`.${version}.`, `.${major}.`);
+    const code = await readFile(resolve(directory, artifact.file), "utf8");
+    const bytes = Buffer.from(renameSourceMapReference(code, artifact.file, file));
+    const map = JSON.parse(await readFile(resolve(directory, `${artifact.file}.map`), "utf8"));
+    if (map.file !== artifact.file) throw new Error(`Invalid CDN source map for ${artifact.file}.`);
+    files.set(file, bytes);
+    files.set(`${file}.map`, Buffer.from(JSON.stringify({ ...map, file })));
+    const integrityFile = `${artifact.module}.${major}.integrity.json`;
+    const json = integrityFiles.get(integrityFile) ?? {
+      name: artifact.module,
+      version,
+      ext: {},
+    };
+    json.ext[`@${artifact.format}`] = {
+      file,
+      url: getCdnUrl(version, file, destination),
+      type: getContentType(file),
+      ...getIntegrity(bytes),
+    };
+    integrityFiles.set(integrityFile, json);
+  }
+  for (const badge of getCdnBadges(version)) {
+    const file = badge.file.replace(`.${version}.`, `.${major}.`);
+    const bundle = badge.bundle.replace(`.${version}.`, `.${major}.`);
+    files.set(file, Buffer.from(renderBadge("size", getSizeBadgeMessage(files.get(bundle)))));
+  }
+  for (const [file, json] of integrityFiles) {
+    files.set(file, Buffer.from(`${JSON.stringify(json, null, 2)}\n`));
+  }
+  return uploads.map((upload) => ({ ...upload, bytes: files.get(upload.file) }));
 }
 
 /** Size badge for each module's default (`min.js`) bundle, published next to it. */
@@ -64,17 +134,44 @@ export function getContentType(file) {
 }
 
 /** Lists the uploads for a version: bundles, source maps and badges first, integrity files last. */
-export function getCdnUploads(version) {
+export function getCdnUploads(version, destination) {
+  const path = getCdnPath(version, destination);
   const files = getCdnArtifacts(version).flatMap(({ file }) => [file, `${file}.map`]);
   const badges = getCdnBadges(version).map(({ file }) => file);
   const integrityFiles = modules.map((module) => `${module}.${version}.integrity.json`);
   return [...files, ...badges, ...integrityFiles].map((file) => ({
     file,
-    blob: `${getCdnPath(version)}/${file}`,
-    url: getCdnUrl(version, file),
+    blob: `${path}/${file}`,
+    url: getCdnUrl(version, file, destination),
     contentType: getContentType(file),
     cacheControl,
   }));
+}
+
+/** Reads prepared bytes, adapting only integrity URLs for an explicit publishing destination. */
+export async function readCdnFile(version, file, directory = cdnDirectory, destination) {
+  const bytes = await readFile(resolve(directory, file));
+  if (destination === undefined || !file.endsWith(".integrity.json")) return bytes;
+  const json = JSON.parse(bytes.toString("utf8"));
+  const artifacts = getCdnArtifacts(version).filter(
+    ({ module }) => file === `${module}.${version}.integrity.json`,
+  );
+  if (
+    artifacts.length === 0 ||
+    json.name !== artifacts[0].module ||
+    json.version !== version ||
+    Object.keys(json.ext ?? {}).length !== artifacts.length
+  ) {
+    throw new Error(`Invalid CDN integrity metadata in ${file}.`);
+  }
+  for (const artifact of artifacts) {
+    const entry = json.ext[`@${artifact.format}`];
+    if (entry?.file !== artifact.file) {
+      throw new Error(`Invalid CDN integrity entry @${artifact.format} in ${file}.`);
+    }
+    entry.url = getCdnUrl(version, artifact.file, destination);
+  }
+  return Buffer.from(`${JSON.stringify(json, null, 2)}\n`);
 }
 
 /** Formats the minified and gzip size of a bundle as the badge message. */
@@ -147,7 +244,13 @@ function renameSourceMapReference(code, source, file) {
  * Copies the built browser bundles to `cdn/` under immutable versioned names, with source maps,
  * a `<module>.<version>.size.svg` badge, and an `<module>.<version>.integrity.json` file per module.
  */
-export async function prepareCdn({ version, sourceDirectory, outputDirectory = cdnDirectory }) {
+export async function prepareCdn({
+  version,
+  sourceDirectory,
+  outputDirectory = cdnDirectory,
+  destination,
+}) {
+  getCdnPath(version, destination);
   await rm(outputDirectory, { recursive: true, force: true });
   await mkdir(outputDirectory, { recursive: true });
 
@@ -181,7 +284,7 @@ export async function prepareCdn({ version, sourceDirectory, outputDirectory = c
     };
     integrityJson.ext[`@${artifact.format}`] = {
       file: artifact.file,
-      url: getCdnUrl(version, artifact.file),
+      url: getCdnUrl(version, artifact.file, destination),
       type: getContentType(artifact.file),
       ...getIntegrity(bytes),
     };

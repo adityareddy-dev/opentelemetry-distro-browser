@@ -103,8 +103,29 @@ remain provisional until exact supported versions are declared and tested.
 
 ## CDN and loader snippet
 
-Each release publishes the UMD and IIFE bundles to an immutable versioned CDN location, following
-the Application Insights JavaScript SDK release layout:
+The publisher supports explicit preview and public destinations with immutable versioned filenames:
+
+```text
+https://js.monitor.azure.com/next/otel/<module>.<version>.<format>
+https://js.monitor.azure.com/scripts/otel/<module>.<version>.<format>
+```
+
+Select one destination per invocation after `npm run build`:
+
+```sh
+npm run cdn:publish -- --account <storage-account> --destination public
+npm run cdn:publish -- --account <storage-account> --destination next
+```
+
+Both copies retain the full package version, including its beta suffix. For `0.1.0-beta.1`, the
+default SDK URLs are
+`https://js.monitor.azure.com/next/otel/opentelemetry-browser.0.1.0-beta.1.min.js` and
+`https://js.monitor.azure.com/scripts/otel/opentelemetry-browser.0.1.0-beta.1.min.js`.
+Instrumentation bundles, UMD variants, source maps, size badges and integrity metadata accompany
+the SDK in each destination. Publishing adapts the integrity URLs to the selected destination in
+temporary local files without changing the prepared `cdn/` files or bundle bytes.
+
+Omitting `--destination` retains the legacy version-derived channel location:
 
 ```text
 https://js.monitor.azure.com/scripts/otel/<channel>/<module>.<version>.<format>
@@ -122,16 +143,69 @@ the source map references. `npm run cdn:publish -- --account <storage-account>` 
 the Azure CLI, using Entra ID login unless `AZURE_STORAGE_SAS_TOKEN` is set, with
 `public, max-age=31536000, immutable, no-transform` caching. It uploads the integrity files last,
 never overwrites a published file, skips files that are already published with identical content,
-and fails if a published file differs. Use `--dry-run` to list the URLs without uploading.
+and fails if a published file differs. Use `--dry-run` to list the URLs without Azure calls,
+uploads or public verification. `--container` defaults to `cdn`; `--container tst` uploads to the
+isolated test container and skips production CDN verification, independently of `--dry-run`.
+Neither destination selection nor test mode changes npm tags, versions or beta release triggers.
+Publishing never deletes or rewrites existing legacy channel assets.
+
+### Major-version aliases and promotion
+
+Customers can use `opentelemetry-browser.0.min.js` to receive updates within major version `0`.
+These aliases deliberately omit the beta suffix. The same major-only naming applies to both
+modules, every IIFE/UMD format, source maps, size badges and integrity files:
+
+```text
+https://js.monitor.azure.com/next/otel/opentelemetry-browser.0.min.js
+https://js.monitor.azure.com/scripts/otel/opentelemetry-browser.0.min.js
+```
+
+Major aliases use `public, max-age=1800, no-transform` caching. Their source map references and
+map `file` fields use the major-only names; their integrity metadata records the full activated
+version and hashes the actual alias bundle bytes. Fully versioned files keep their one-year
+immutable caching and cannot be replaced.
+
+Successful `--destination next` publication activates next aliases after immutable-file verification.
+Public versioned publication never changes public aliases. A caller publishing both destinations
+must publish **public first, then next**, so next activation follows both successful uploads.
+Promote an already-published version to public aliases explicitly:
+
+```sh
+npm run cdn:activate -- --account <storage-account> --destination public
+```
+
+This command requires fresh `cdn/` files for the selected full version, not stale build artifacts.
+For scheduled promotion without local build artifacts, download the immutable release from storage:
+
+```sh
+node scripts/activate-cdn.mjs --account <storage-account> --destination public --version 0.1.0-beta.1 --from-storage
+```
+
+`--version` defaults to `package.json`; `--from-storage` uses that exact published version and
+cleans up its temporary downloads. Activation checks every immutable object's content before any
+alias write and verifies its production CDN URLs unless `--container tst` is selected. It skips
+identical aliases, uses the observed ETag when replacing an alias, and requires absence when
+creating one. Missing versions, content differences and failed conditional writes fail activation.
+Each object is guarded independently; the CDN has no atomic multi-file promotion, and clients can
+retain the previous aliases until the 30-minute cache expires. Integrity files are uploaded last.
+`--dry-run` makes no Azure or CDN calls; `--container tst` confines writes to the test container.
+`--destination next` is also supported for an explicit activation retry.
 
 After uploading, `cdn:publish` runs `npm run cdn:verify`, which fetches every public URL and fails
 unless each returns 200 with the expected `Content-Type`, the immutable `Cache-Control` directives,
 `Access-Control-Allow-Origin: *`, bytes identical to `cdn/`, and integrity files whose hashes match
-the served bundles. `npm run cdn:verify -- --remote-only` skips the local comparison to audit an
-earlier release.
+the served bundles. Local integrity URLs are adapted for comparison to the selected destination.
+Use `npm run cdn:verify -- --destination next` or `--destination public` to verify that destination;
+omitting the option verifies the legacy channel. `--remote-only` skips the local comparison to
+audit an earlier release.
+Use `--major --destination public --version <full-version>` to audit promoted aliases after CDN
+caches expire; it checks their short cache policy, full activated version and alias-specific hashes.
 
 The `./snippet` helper generates the copy/paste loader. Without `src`, it loads the `min.js` IIFE
-bundle for the package version, so the snippet and the bundle versions always match. It enables the
+bundle for the package version from the legacy channel, so the snippet and the bundle versions
+always match. Set `src` to an explicit preview/public versioned or major-alias URL to load a new
+destination. A fixed `integrity` value pins the current bytes; omit it for an auto-updating alias
+or update it together with the alias. It enables the
 same defaults as `getInstrumentations()`, `fetch` and XHR, alongside Azure Monitor export and page
 views. The loader reads the `Microsoft.OpenTelemetry` global, which a UMD bundle does not set when an AMD loader is
 present. Add the generated script to the page `<head>` and replace `CHANNEL`, `VERSION`,

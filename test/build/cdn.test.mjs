@@ -5,8 +5,10 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { readFile, readdir } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 import { basename, resolve } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
@@ -17,9 +19,13 @@ import {
   getCdnArtifacts,
   getCdnBadges,
   getCdnChannel,
+  getCdnPath,
   getCdnUrl,
   getSizeBadgeMessage,
   modules,
+  prepareCdn,
+  prepareCdnAliases,
+  readCdnFile,
   renderBadge,
   root,
 } from "../../scripts/cdn.mjs";
@@ -39,6 +45,258 @@ test("maps release versions to CDN channels", () => {
   assert.equal(
     getCdnUrl("1.2.3", "opentelemetry-browser.1.2.3.min.js"),
     "https://js.monitor.azure.com/scripts/otel/b/opentelemetry-browser.1.2.3.min.js",
+  );
+});
+
+for (const [destination, path] of [
+  ["next", "next/otel"],
+  ["public", "scripts/otel"],
+]) {
+  test(`${destination} preserves full beta filenames in every upload`, () => {
+    const beta = "0.1.0-beta.1";
+    const uploads = getCdnUploads(beta, destination);
+    assert.equal(getCdnPath(beta, destination), path);
+    assert.equal(uploads.length, 20);
+    assert.deepEqual(
+      uploads.map(({ file }) => file),
+      getCdnUploads(beta).map(({ file }) => file),
+    );
+    for (const upload of uploads) {
+      assert.equal(upload.blob, `${path}/${upload.file}`);
+      assert.equal(upload.url, `https://js.monitor.azure.com/${upload.blob}`);
+      assert.ok(upload.file.includes(`.${beta}.`), upload.file);
+      assert.equal(upload.cacheControl, cacheControl);
+    }
+    assert.ok(uploads.some(({ file }) => file === `opentelemetry-browser.${beta}.min.js`));
+    assert.ok(
+      uploads.some(
+        ({ file }) => file === `opentelemetry-browser-instrumentations.${beta}.umd.min.js.map`,
+      ),
+    );
+    assert.ok(uploads.slice(-2).every(({ file }) => file.endsWith(".integrity.json")));
+    for (const release of ["1.2.3", "0.1.0-alpha.2", "1.0.0-rc.1"]) {
+      assert.equal(getCdnPath(release, destination), path);
+    }
+  });
+
+  test(`${destination} prepares and publishes destination-specific integrity without changing cdn/`, async (t) => {
+    const directory = await mkdtemp(resolve(tmpdir(), "otel-cdn-test-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    await prepareCdn({
+      version,
+      sourceDirectory: resolve(root, "dist", "browser"),
+      outputDirectory: directory,
+      destination,
+    });
+    const uploads = getCdnUploads(version, destination);
+    const original = new Map(
+      await Promise.all(
+        uploads.map(async ({ file }) => [file, await readFile(resolve(cdnDirectory, file))]),
+      ),
+    );
+    const stored = new Map();
+    const temporaryPaths = [];
+    let writes = 0;
+    const run = (args) => {
+      const option = (name) => args[args.indexOf(name) + 1];
+      assert.equal(option("--container-name"), "cdn");
+      const blob = option("--name");
+      assert.ok(blob.startsWith(`${path}/`));
+      if (args[2] === "show") {
+        const existing = stored.get(blob);
+        return existing
+          ? { status: 0, stdout: sha("md5", existing.bytes), stderr: "" }
+          : { status: 3, stdout: "", stderr: "BlobNotFound" };
+      }
+      assert.equal(args[2], "upload");
+      assert.equal(option("--overwrite"), "false");
+      const file = option("--file");
+      const bytes = readFileSync(file);
+      assert.equal(option("--content-md5"), sha("md5", bytes));
+      if (blob.endsWith(".integrity.json")) {
+        assert.notEqual(file, resolve(cdnDirectory, basename(blob)));
+        temporaryPaths.push(file);
+      }
+      stored.set(blob, {
+        bytes,
+        headers: {
+          "Content-Type": option("--content-type"),
+          "Cache-Control": option("--content-cache-control"),
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+      writes++;
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    let verifications = 0;
+    const fetch = async (url) => {
+      const value = stored.get(new URL(url).pathname.slice(1));
+      assert.ok(value, url);
+      return new Response(value.bytes, { headers: value.headers });
+    };
+    const options = {
+      version,
+      account: "store",
+      container: "cdn",
+      destination,
+      run,
+      activate: async () => {},
+      log: () => {},
+      verify: async (options) => {
+        assert.equal(options.destination, destination);
+        verifications++;
+        return verifyCdn({ ...options, fetch });
+      },
+    };
+    await publishCdn(options);
+    assert.equal(writes, uploads.length);
+    assert.equal(verifications, 1);
+    for (const upload of uploads) {
+      const bytes = stored.get(upload.blob).bytes;
+      assert.deepEqual(bytes, await readFile(resolve(directory, upload.file)));
+      assert.deepEqual(
+        await readFile(resolve(cdnDirectory, upload.file)),
+        original.get(upload.file),
+      );
+      if (upload.file.endsWith(".integrity.json")) {
+        const json = JSON.parse(bytes);
+        for (const entry of Object.values(json.ext)) {
+          assert.equal(entry.url, `https://js.monitor.azure.com/${path}/${entry.file}`);
+          assert.equal(entry.hashes.sha384, sha("sha384", original.get(entry.file)));
+        }
+      }
+    }
+    for (const file of temporaryPaths) await assert.rejects(readFile(file), { code: "ENOENT" });
+
+    await publishCdn(options);
+    assert.equal(writes, uploads.length, "second publish skips every identical file");
+    assert.equal(verifications, 2);
+    const integrityUpload = uploads.at(-1);
+    const saved = stored.get(integrityUpload.blob);
+    stored.set(integrityUpload.blob, { ...saved, bytes: Buffer.from("different metadata") });
+    await assert.rejects(publishCdn(options), /already exists with different content/);
+    assert.equal(verifications, 2, "conflicting publish does not verify");
+    stored.set(integrityUpload.blob, saved);
+    const json = JSON.parse(saved.bytes);
+    json.ext["@min.js"].url = getCdnUrl(version, json.ext["@min.js"].file);
+    stored.set(integrityUpload.blob, { ...saved, bytes: Buffer.from(JSON.stringify(json)) });
+    await assert.rejects(
+      verifyCdn({ version, destination, fetch, remoteOnly: true, log: () => {} }),
+      /url .*expected/,
+    );
+
+    for (const failure of ["AuthorizationPermissionMismatch", "network unavailable"]) {
+      await assert.rejects(
+        publishCdn({
+          ...options,
+          run: () => ({ status: 1, stdout: "", stderr: failure }),
+        }),
+        new RegExp(`Unable to check .*${failure}`),
+      );
+    }
+    let failedPath;
+    await assert.rejects(
+      publishCdn({
+        ...options,
+        run: (args) => {
+          const blob = args[args.indexOf("--name") + 1];
+          if (!blob.endsWith(".integrity.json")) return run(args);
+          if (args[2] === "show") return { status: 3, stdout: "", stderr: "BlobNotFound" };
+          failedPath = args[args.indexOf("--file") + 1];
+          return { status: 1, stdout: "", stderr: "upload failed" };
+        },
+      }),
+      /Failed to upload .*upload failed/,
+    );
+    await assert.rejects(readFile(failedPath), { code: "ENOENT" });
+  });
+
+  test(`${destination} dry-run is offline and tst uploads never verify production`, async () => {
+    const logs = [];
+    const options = {
+      version,
+      account: "store",
+      container: "tst",
+      destination,
+      log: (line) => logs.push(line),
+      verify: () => assert.fail("must not verify production CDN"),
+      activate: async () => {},
+    };
+    await publishCdn({
+      ...options,
+      dryRun: true,
+      run: () => assert.fail("dry-run must not call Azure"),
+    });
+    assert.equal(logs.length, 20);
+    assert.ok(logs.every((line) => line.includes(`/${path}/`)));
+    let uploads = 0;
+    await publishCdn({
+      ...options,
+      run: (args) => {
+        assert.equal(args[args.indexOf("--container-name") + 1], "tst");
+        if (args[2] === "show") return { status: 3, stdout: "", stderr: "BlobNotFound" };
+        uploads++;
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.equal(uploads, 20);
+    assert.match(logs.at(-1), /Skipped public CDN verification.*tst/);
+
+    const cli = spawnSync(
+      process.execPath,
+      ["scripts/publish-cdn.mjs", "--account", "store", "--destination", destination, "--dry-run"],
+      { cwd: root, encoding: "utf8", timeout: 30_000 },
+    );
+    assert.equal(cli.status, 0, cli.stderr);
+    assert.ok(cli.stdout.includes(`/${path}/opentelemetry-browser.${version}.min.js`));
+    assert.doesNotMatch(cli.stdout, /\/scripts\/otel\/beta\//);
+  });
+}
+
+test("rejects invalid destinations before storage or public requests", async () => {
+  assert.throws(() => getCdnUploads(version, "beta"), /Unsupported CDN destination/);
+  assert.throws(() => getCdnUploads("latest", "next"), /Unsupported CDN release version/);
+  const offline = () => assert.fail("invalid destination must not make network calls");
+  await assert.rejects(
+    publishCdn({ version, destination: "wrong", run: offline, verify: offline }),
+    /Unsupported CDN destination/,
+  );
+  await assert.rejects(
+    verifyCdn({ version, destination: "wrong", fetch: offline }),
+    /Unsupported CDN destination/,
+  );
+  for (const script of ["publish-cdn", "verify-cdn"]) {
+    const cli = spawnSync(
+      process.execPath,
+      [
+        `scripts/${script}.mjs`,
+        "--destination",
+        "wrong",
+        ...(script === "publish-cdn" ? ["--account", "store", "--dry-run"] : []),
+      ],
+      { cwd: root, encoding: "utf8", timeout: 30_000 },
+    );
+    assert.notEqual(cli.status, 0);
+    assert.match(cli.stderr, /Unsupported CDN destination/);
+  }
+});
+
+test("rejects malformed destination integrity metadata", async (t) => {
+  const directory = await mkdtemp(resolve(tmpdir(), "otel-cdn-test-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = `opentelemetry-browser.${version}.integrity.json`;
+  const json = JSON.parse(await readFile(resolve(cdnDirectory, file)));
+  delete json.ext["@min.js"];
+  await writeFile(resolve(directory, file), JSON.stringify(json));
+  await assert.rejects(
+    readCdnFile(version, file, directory, "next"),
+    /Invalid CDN integrity metadata/,
+  );
+  json.ext["@min.js"] = { file: "wrong.js" };
+  await writeFile(resolve(directory, file), JSON.stringify(json));
+  await assert.rejects(
+    readCdnFile(version, file, directory, "public"),
+    /Invalid CDN integrity entry/,
   );
 });
 
@@ -112,6 +370,32 @@ test("the build prepares versioned CDN files with source maps and integrity", as
       const map = JSON.parse(await readFile(resolve(cdnDirectory, `${artifact.file}.map`), "utf8"));
       assert.equal(map.file, artifact.file);
       assert.ok(map.sourcesContent?.length > 0);
+    }
+  }
+});
+
+test("the production beta bundles produce major aliases with only source map references changed", async () => {
+  const major = version.split(".")[0];
+  for (const destination of ["next", "public"]) {
+    const aliases = await prepareCdnAliases(version, cdnDirectory, destination);
+    assert.equal(aliases.length, 20);
+    for (const artifact of getCdnArtifacts(version)) {
+      const file = artifact.file.replace(`.${version}.`, `.${major}.`);
+      const alias = aliases.find((alias) => alias.file === file);
+      const source = await readFile(resolve(cdnDirectory, artifact.file), "utf8");
+      assert.equal(
+        alias.bytes.toString(),
+        source.replace(
+          `//# sourceMappingURL=${artifact.file}.map`,
+          `//# sourceMappingURL=${file}.map`,
+        ),
+      );
+      assert.equal(alias.url, getCdnUrl(version, file, destination));
+      const integrity = JSON.parse(
+        aliases.find((alias) => alias.file === `${artifact.module}.${major}.integrity.json`).bytes,
+      );
+      assert.equal(integrity.version, version);
+      assert.equal(integrity.ext[`@${artifact.format}`].hashes.sha384, sha("sha384", alias.bytes));
     }
   }
 });

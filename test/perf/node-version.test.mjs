@@ -84,6 +84,7 @@ test("network entry points reject vulnerable runtimes before fetch or HTTP reque
     "scripts/perf/export.mjs",
     "scripts/verify-cdn.mjs",
     "scripts/publish-cdn.mjs",
+    "scripts/activate-cdn.mjs",
   ]) {
     for (const version of ["22.23.3", "24.22.0", "26.12.0"]) {
       const entry = new URL(script, root).href;
