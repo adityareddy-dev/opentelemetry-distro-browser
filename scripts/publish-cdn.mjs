@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -11,6 +11,8 @@ import { parseArgs } from "node:util";
 import {
   cdnDirectory,
   getCdnAliasUploads,
+  getCdnMajor,
+  getCdnPath,
   getCdnUploads,
   prepareCdnAliases,
   readCdnFile,
@@ -36,14 +38,228 @@ AZURE_STORAGE_SAS_TOKEN is set.`;
 
 const quote = (value) => (/^[\w./:=@-]+$/.test(value) ? value : `"${value.replace(/"/g, '\\"')}"`);
 
-function az(args) {
+function az(args, { signal } = {}) {
   // `az` is a batch file on Windows, which Node only starts through a shell.
   const windows = process.platform === "win32";
-  const result = spawnSync("az", windows ? args.map(quote) : args, {
-    encoding: "utf8",
-    shell: windows,
+  return new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+    const child = spawn("az", windows ? args.map(quote) : args, {
+      shell: windows,
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    let failure;
+    let termination;
+    const terminate = (error) => {
+      if (failure) return;
+      failure = error;
+      if (windows && child.pid) {
+        // Killing cmd.exe alone leaves the Azure CLI subprocess running.
+        termination = new Promise((done) => {
+          const kill = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+            stdio: "ignore",
+            windowsHide: true,
+          });
+          kill.once("error", (error) => {
+            failure = new AggregateError(
+              [failure, error],
+              "Unable to stop Azure CLI process tree.",
+            );
+            child.kill("SIGKILL");
+            done();
+          });
+          kill.once("close", (status) => {
+            if (status !== 0) {
+              failure = new AggregateError(
+                [failure],
+                `Unable to stop Azure CLI process tree (exit ${status}).`,
+              );
+              child.kill("SIGKILL");
+            }
+            done();
+          });
+        });
+      } else child.kill("SIGKILL");
+    };
+    const abort = () => terminate(signal.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(
+      () => terminate(new Error("Azure CLI timed out after 30 seconds.")),
+      30_000,
+    );
+    child.stdout.setEncoding("utf8").on("data", (data) => {
+      stdout += data;
+    });
+    child.stderr.setEncoding("utf8").on("data", (data) => {
+      stderr += data;
+    });
+    child.once("error", (error) => {
+      failure = error;
+    });
+    child.once("close", async (status) => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+      await termination;
+      if (failure) reject(failure);
+      else resolve({ status, stdout, stderr });
+    });
   });
-  if (result.error) throw result.error;
+}
+
+/** A finite, renewable storage lease serializes all clients writing one major alias set. */
+async function withActivationLease(
+  { version, destination, target, directory, run, log, renewalIntervalMs },
+  activate,
+) {
+  const blob = `${getCdnPath(version, destination)}/.major-${getCdnMajor(version)}.activation.lock`;
+  const existing = await run([
+    "storage",
+    "blob",
+    "show",
+    ...target,
+    "--name",
+    blob,
+    "--output",
+    "none",
+  ]);
+  if (existing.status !== 0) {
+    if (!/BlobNotFound|ResourceNotFound|does not exist/i.test(existing.stderr)) {
+      throw new Error(`Unable to check activation lock ${blob}: ${existing.stderr.trim()}`);
+    }
+    const file = resolve(directory, "activation.lock");
+    await writeFile(file, "");
+    const created = await run([
+      "storage",
+      "blob",
+      "upload",
+      ...target,
+      "--name",
+      blob,
+      "--file",
+      file,
+      "--content-type",
+      "application/octet-stream",
+      "--content-cache-control",
+      "no-store",
+      "--content-md5",
+      createHash("md5").update("").digest("base64"),
+      "--overwrite",
+      "false",
+      "--if-none-match",
+      "*",
+      "--only-show-errors",
+    ]);
+    if (created.status !== 0) {
+      if (!/BlobAlreadyExists|ConditionNotMet/i.test(created.stderr)) {
+        throw new Error(`Unable to create activation lock ${blob}: ${created.stderr.trim()}`);
+      }
+      log(`Activation lock ${blob} was initialized by another client.`);
+    }
+  }
+  const id = randomUUID();
+  const leaseArgs = [
+    ...target,
+    "--blob-name",
+    blob,
+    "--timeout",
+    "20",
+    "--output",
+    "none",
+    "--only-show-errors",
+  ];
+  let expires = performance.now() + 60_000;
+  const acquired = await run([
+    "storage",
+    "blob",
+    "lease",
+    "acquire",
+    ...leaseArgs,
+    "--lease-duration",
+    "60",
+    "--proposed-lease-id",
+    id,
+  ]);
+  if (acquired.status !== 0) {
+    throw new Error(`Unable to acquire activation lease ${blob}: ${acquired.stderr.trim()}`);
+  }
+  const controller = new AbortController();
+  let failure;
+  let renewing;
+  let timer;
+  let stopped = false;
+  const renew = () => {
+    if (renewing) return renewing;
+    renewing = (async () => {
+      try {
+        controller.signal.throwIfAborted();
+        if (performance.now() >= expires) throw new Error(`Activation lease ${blob} expired.`);
+        const started = performance.now();
+        const renewed = await run(
+          ["storage", "blob", "lease", "renew", ...leaseArgs, "--lease-id", id],
+          { signal: controller.signal },
+        );
+        if (renewed.status !== 0) {
+          throw new Error(`Unable to renew activation lease ${blob}: ${renewed.stderr.trim()}`);
+        }
+        expires = started + 60_000;
+      } catch (error) {
+        failure = error;
+        controller.abort(error);
+        throw error;
+      }
+    })().finally(() => {
+      renewing = undefined;
+    });
+    return renewing;
+  };
+  const schedule = () => {
+    if (stopped) return;
+    timer = setTimeout(() => {
+      renew().then(schedule, (error) => log(`Activation stopped: ${error.message}`));
+    }, renewalIntervalMs);
+  };
+  schedule();
+  const errors = [];
+  let result;
+  try {
+    result = await activate({ renew, signal: controller.signal });
+    if (failure) throw failure;
+  } catch (error) {
+    if (failure && failure !== error) errors.push(failure);
+    errors.push(error);
+  } finally {
+    stopped = true;
+    clearTimeout(timer);
+    if (renewing) {
+      try {
+        await renewing;
+      } catch (error) {
+        if (!errors.includes(error)) errors.push(error);
+      }
+    }
+    try {
+      const released = await run([
+        "storage",
+        "blob",
+        "lease",
+        "release",
+        ...leaseArgs,
+        "--lease-id",
+        id,
+      ]);
+      if (released.status !== 0) {
+        errors.push(
+          new Error(`Unable to release activation lease ${blob}: ${released.stderr.trim()}`),
+        );
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1)
+    throw new AggregateError(errors, errors.map((error) => error.message).join("\n"));
   return result;
 }
 
@@ -86,7 +302,7 @@ export async function publishCdn({
       }
       const bytes = await readCdnFile(version, upload.file, directory, destination);
       const md5 = createHash("md5").update(bytes).digest("base64");
-      const existing = run([
+      const existing = await run([
         "storage",
         "blob",
         "show",
@@ -114,7 +330,7 @@ export async function publishCdn({
         path = resolve(temporaryDirectory, upload.file);
         await writeFile(path, bytes);
       }
-      const uploaded = run([
+      const uploaded = await run([
         "storage",
         "blob",
         "upload",
@@ -172,9 +388,13 @@ export async function activateCdnAliases({
   dryRun = false,
   run = az,
   verify = verifyCdn,
+  renewalIntervalMs = 15_000,
   log = (line) => process.stdout.write(`${line}\n`),
 }) {
   const aliases = getCdnAliasUploads(version, destination);
+  if (!Number.isFinite(renewalIntervalMs) || renewalIntervalMs <= 0 || renewalIntervalMs > 15_000) {
+    throw new Error("Activation lease renewal interval must be between 0 and 15000 ms.");
+  }
   const uploads = getCdnUploads(version, destination);
   if (dryRun) {
     for (const alias of aliases) log(`Would activate ${version} -> ${alias.url}`);
@@ -187,7 +407,7 @@ export async function activateCdnAliases({
     if (fromStorage) directory = temporaryDirectory;
     // Check every immutable object before changing any alias, including in the isolated tst container.
     for (const upload of uploads) {
-      const existing = run([
+      const existing = await run([
         "storage",
         "blob",
         "show",
@@ -203,7 +423,7 @@ export async function activateCdnAliases({
         throw new Error(`Unable to activate unpublished ${upload.url}: ${existing.stderr.trim()}`);
       }
       if (fromStorage) {
-        const downloaded = run([
+        const downloaded = await run([
           "storage",
           "blob",
           "download",
@@ -226,66 +446,87 @@ export async function activateCdnAliases({
     }
     const prepared = await prepareCdnAliases(version, directory, destination);
     if (container !== "tst") await verify({ version, directory, destination, log });
-    for (const alias of prepared) {
-      const md5 = createHash("md5").update(alias.bytes).digest("base64");
-      const existing = run([
-        "storage",
-        "blob",
-        "show",
-        ...target,
-        "--name",
-        alias.blob,
-        "--query",
-        "{md5:properties.contentSettings.contentMd5,etag:properties.etag,cacheControl:properties.contentSettings.cacheControl}",
-        "--output",
-        "json",
-      ]);
-      let conditions;
-      if (existing.status === 0) {
-        const properties = JSON.parse(existing.stdout);
-        if (properties.md5 === md5 && properties.cacheControl === alias.cacheControl) {
-          log(`Skipped ${alias.url} (already activated)`);
-          continue;
-        }
-        if (typeof properties.etag !== "string" || properties.etag.length === 0) {
-          throw new Error(
-            `Missing ETag for ${alias.url}; refusing unconditional alias replacement.`,
+    return await withActivationLease(
+      {
+        version,
+        destination,
+        target,
+        directory: temporaryDirectory,
+        run,
+        log,
+        renewalIntervalMs,
+      },
+      async ({ renew, signal }) => {
+        for (const alias of prepared) {
+          await renew();
+          const md5 = createHash("md5").update(alias.bytes).digest("base64");
+          const existing = await run(
+            [
+              "storage",
+              "blob",
+              "show",
+              ...target,
+              "--name",
+              alias.blob,
+              "--query",
+              "{md5:properties.contentSettings.contentMd5,etag:properties.etag,cacheControl:properties.contentSettings.cacheControl}",
+              "--output",
+              "json",
+            ],
+            { signal },
           );
+          let conditions;
+          if (existing.status === 0) {
+            const properties = JSON.parse(existing.stdout);
+            if (properties.md5 === md5 && properties.cacheControl === alias.cacheControl) {
+              log(`Skipped ${alias.url} (already activated)`);
+              continue;
+            }
+            if (typeof properties.etag !== "string" || properties.etag.length === 0) {
+              throw new Error(
+                `Missing ETag for ${alias.url}; refusing unconditional alias replacement.`,
+              );
+            }
+            conditions = ["--if-match", properties.etag];
+          } else if (/BlobNotFound|ResourceNotFound|does not exist/i.test(existing.stderr)) {
+            conditions = ["--if-none-match", "*"];
+          } else {
+            throw new Error(`Unable to check ${alias.url}: ${existing.stderr.trim()}`);
+          }
+          const path = resolve(temporaryDirectory, alias.file);
+          await writeFile(path, alias.bytes);
+          await renew();
+          const uploaded = await run(
+            [
+              "storage",
+              "blob",
+              "upload",
+              ...target,
+              "--name",
+              alias.blob,
+              "--file",
+              path,
+              "--content-type",
+              alias.contentType,
+              "--content-cache-control",
+              alias.cacheControl,
+              "--content-md5",
+              md5,
+              "--overwrite",
+              "true",
+              ...conditions,
+              "--only-show-errors",
+            ],
+            { signal },
+          );
+          if (uploaded.status !== 0) {
+            throw new Error(`Failed to activate ${alias.url}: ${uploaded.stderr.trim()}`);
+          }
+          log(`Activated ${alias.url} from ${version}`);
         }
-        conditions = ["--if-match", properties.etag];
-      } else if (/BlobNotFound|ResourceNotFound|does not exist/i.test(existing.stderr)) {
-        conditions = ["--if-none-match", "*"];
-      } else {
-        throw new Error(`Unable to check ${alias.url}: ${existing.stderr.trim()}`);
-      }
-      const path = resolve(temporaryDirectory, alias.file);
-      await writeFile(path, alias.bytes);
-      const uploaded = run([
-        "storage",
-        "blob",
-        "upload",
-        ...target,
-        "--name",
-        alias.blob,
-        "--file",
-        path,
-        "--content-type",
-        alias.contentType,
-        "--content-cache-control",
-        alias.cacheControl,
-        "--content-md5",
-        md5,
-        "--overwrite",
-        "true",
-        ...conditions,
-        "--only-show-errors",
-      ]);
-      if (uploaded.status !== 0) {
-        throw new Error(`Failed to activate ${alias.url}: ${uploaded.stderr.trim()}`);
-      }
-      log(`Activated ${alias.url} from ${version}`);
-    }
-    return aliases;
+        return aliases;
+      },
+    );
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
   }

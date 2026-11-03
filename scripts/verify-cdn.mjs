@@ -198,12 +198,13 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     process.exit(0);
   }
   const { version } = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
+  const selectedVersion = values.version ?? version;
   const verified = await verifyCdn({
-    version: values.version ?? version,
+    version: selectedVersion,
     destination: values.destination,
     major: values.major,
     remoteOnly: values["remote-only"],
     origin: values.origin,
   });
-  process.stdout.write(`Verified ${verified.length} CDN files for ${version}.\n`);
+  process.stdout.write(`Verified ${verified.length} CDN files for ${selectedVersion}.\n`);
 }

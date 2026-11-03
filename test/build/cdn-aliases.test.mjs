@@ -2,11 +2,13 @@
 // Licensed under the MIT License.
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createServer } from "node:http";
 import { resolve } from "node:path";
 import test from "node:test";
 import {
@@ -19,6 +21,7 @@ import {
   getIntegrity,
   prepareCdn,
   prepareCdnAliases,
+  readCdnFile,
   root,
 } from "../../scripts/cdn.mjs";
 import { activateCdnAliases, publishCdn } from "../../scripts/publish-cdn.mjs";
@@ -48,13 +51,35 @@ async function release(t, version) {
 
 function storage() {
   const blobs = new Map();
+  const leases = new Map();
   const calls = [];
   let serial = 0;
   const run = (args) => {
     calls.push(args);
     const option = (name) => args[args.indexOf(name) + 1];
-    const key = `${option("--container-name")}/${option("--name")}`;
+    const key = `${option("--container-name")}/${option(args[2] === "lease" ? "--blob-name" : "--name")}`;
     const existing = blobs.get(key);
+    if (args[2] === "lease") {
+      const lease = leases.get(key);
+      if (args[3] === "acquire") {
+        assert.ok(existing, "lock blob must exist");
+        assert.equal(option("--lease-duration"), "60");
+        if (lease && lease.expires > performance.now()) {
+          return { status: 1, stdout: "", stderr: "LeaseAlreadyPresent" };
+        }
+        leases.set(key, { id: option("--proposed-lease-id"), expires: performance.now() + 60_000 });
+      } else {
+        if (lease?.id !== option("--lease-id")) {
+          return { status: 1, stdout: "", stderr: "LeaseIdMismatchWithLeaseOperation" };
+        }
+        if (args[3] === "renew") lease.expires = performance.now() + 60_000;
+        else {
+          assert.equal(args[3], "release");
+          leases.delete(key);
+        }
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    }
     if (args[2] === "show") {
       if (!existing) return { status: 3, stdout: "", stderr: "BlobNotFound" };
       const properties = {
@@ -82,10 +107,20 @@ function storage() {
       )
         return { status: 1, stdout: "", stderr: "ConditionNotMet" };
       assert.equal(option("--content-cache-control"), aliasCacheControl);
+      const name = option("--name");
+      const major = name.slice(name.lastIndexOf("/") + 1).split(".")[1];
+      const lockKey = `${option("--container-name")}/${name.slice(0, name.lastIndexOf("/"))}/.major-${major}.activation.lock`;
+      assert.ok(
+        leases.get(lockKey)?.expires > performance.now(),
+        "alias writes require the live shared lease",
+      );
     } else {
       assert.equal(option("--overwrite"), "false");
       assert.ok(!existing, "immutable blobs must not be overwritten");
-      assert.equal(option("--content-cache-control"), cacheControl);
+      assert.equal(
+        option("--content-cache-control"),
+        key.endsWith(".activation.lock") ? "no-store" : cacheControl,
+      );
     }
     const bytes = readFileSync(option("--file"));
     assert.equal(option("--content-md5"), md5(bytes));
@@ -110,7 +145,7 @@ function storage() {
           : new Response(null, { status: 404 });
       },
     });
-  return { blobs, calls, run, verify };
+  return { blobs, leases, calls, run, verify };
 }
 
 test("next major aliases advance within a major; public aliases change only on promotion", async (t) => {
@@ -345,7 +380,7 @@ test("alias replacement refuses missing ETags and concurrent updates and cleans 
               return { status: 1, stdout: "", stderr: "AuthorizationPermissionMismatch" };
             if (mode === "missing-etag") return { status: 0, stdout: '{"md5":"old"}', stderr: "" };
           }
-          if (args[2] === "upload") {
+          if (args[2] === "upload" && args.includes(aliasCacheControl)) {
             temporaryFile = args[args.indexOf("--file") + 1];
             return { status: 1, stdout: "", stderr: "ConditionNotMet" };
           }
@@ -432,4 +467,248 @@ test("malformed alias source maps and references fail before alias writes", asyn
     prepareCdnAliases(beta.version, beta.directory, "next"),
     /does not end with its source map reference/,
   );
+});
+
+test(
+  "independent activation clients cannot interleave different releases in the same major",
+  { timeout: 10_000 },
+  async (t) => {
+    const azure = storage();
+    const beta1 = await release(t, "0.1.0-beta.1");
+    const beta2 = await release(t, "0.1.0-beta.2");
+    const major1 = await release(t, "1.0.0-beta.1");
+    const options = {
+      account: "store",
+      container: "cdn",
+      destination: "public",
+      verify: azure.verify,
+      log: () => {},
+    };
+    await publishCdn({ ...options, ...beta1, run: azure.run });
+    await publishCdn({ ...options, ...beta2, run: azure.run });
+    let resume;
+    const paused = new Promise((resolve) => {
+      resume = resolve;
+    });
+    let firstWrite;
+    const written = new Promise((resolve) => {
+      firstWrite = resolve;
+    });
+    let interrupted = false;
+    let renewedWhilePaused;
+    const renewal = new Promise((resolve) => {
+      renewedWhilePaused = resolve;
+    });
+    const client1 = async (args) => {
+      const result = azure.run(args);
+      if (interrupted && args[2] === "lease" && args[3] === "renew") renewedWhilePaused();
+      if (!interrupted && args[2] === "upload" && args.includes(aliasCacheControl)) {
+        interrupted = true;
+        firstWrite();
+        await paused;
+      }
+      return result;
+    };
+    const client2 = async (args) => azure.run(args);
+    const first = activateCdnAliases({ ...options, ...beta1, run: client1, renewalIntervalMs: 5 });
+    t.after(() => resume());
+    await written;
+    await assert.rejects(
+      activateCdnAliases({ ...options, ...beta2, run: client2 }),
+      /Unable to acquire activation lease .*LeaseAlreadyPresent/,
+    );
+    await publishCdn({ ...options, ...beta1, destination: "next", run: client2 });
+    await publishCdn({ ...options, ...major1, run: client2 });
+    await activateCdnAliases({ ...options, ...major1, run: client2 });
+    await publishCdn({ ...options, ...beta1, container: "tst", run: client2 });
+    await activateCdnAliases({ ...options, ...beta1, container: "tst", run: client2 });
+    assert.equal(
+      azure.leases.size,
+      1,
+      "other destinations, majors and containers do not share this lock",
+    );
+    await renewal;
+    resume();
+    await first;
+    assert.equal(azure.leases.size, 0);
+    await azure.verify({ ...beta1, destination: "public", major: true, log: () => {} });
+    await activateCdnAliases({ ...options, ...beta2, run: client2 });
+    await azure.verify({ ...beta2, destination: "public", major: true, log: () => {} });
+    assert.equal(azure.leases.size, 0);
+  },
+);
+
+test(
+  "renewal protects a pending upload and failure cancels it before subsequent aliases",
+  { timeout: 10_000 },
+  async (t) => {
+    const azure = storage();
+    const beta = await release(t, "0.1.0-beta.1");
+    const options = {
+      account: "store",
+      container: "cdn",
+      destination: "public",
+      ...beta,
+      verify: azure.verify,
+      log: () => {},
+    };
+    await publishCdn({ ...options, run: azure.run });
+    let renewals = 0;
+    let pending = false;
+    let temporaryFile;
+    let cancelled = false;
+    const run = async (args, { signal } = {}) => {
+      if (args[2] === "lease" && args[3] === "renew") {
+        renewals++;
+        if (pending) return { status: 1, stdout: "", stderr: "LeaseLost" };
+      }
+      if (args[2] === "upload" && args.includes(aliasCacheControl)) {
+        pending = true;
+        temporaryFile = args[args.indexOf("--file") + 1];
+        await new Promise((resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              cancelled = true;
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+        });
+      }
+      return azure.run(args);
+    };
+    await assert.rejects(
+      activateCdnAliases({ ...options, run, renewalIntervalMs: 5 }),
+      /Unable to renew activation lease .*LeaseLost/,
+    );
+    assert.ok(renewals >= 3, "lease renews while an upload is pending");
+    assert.equal(cancelled, true);
+    assert.equal(azure.leases.size, 0);
+    assert.ok(!azure.blobs.has("cdn/scripts/otel/opentelemetry-browser.0.min.js"));
+    await assert.rejects(readFile(temporaryFile), { code: "ENOENT" });
+  },
+);
+
+test("lease acquisition, release and alias-write failures are surfaced without leaking timers", async (t) => {
+  const azure = storage();
+  const beta = await release(t, "0.1.0-beta.1");
+  const options = {
+    account: "store",
+    container: "cdn",
+    destination: "public",
+    ...beta,
+    verify: azure.verify,
+    log: () => {},
+  };
+  await publishCdn({ ...options, run: azure.run });
+  await assert.rejects(
+    activateCdnAliases({
+      ...options,
+      run: (args) =>
+        args[2] === "lease" && args[3] === "acquire"
+          ? { status: 1, stdout: "", stderr: "AuthorizationPermissionMismatch" }
+          : azure.run(args),
+    }),
+    /Unable to acquire activation lease .*AuthorizationPermissionMismatch/,
+  );
+  assert.equal(azure.leases.size, 0);
+  await assert.rejects(
+    activateCdnAliases({
+      ...options,
+      run: (args) => {
+        if (args[2] === "upload" && args.includes(aliasCacheControl)) {
+          return { status: 1, stdout: "", stderr: "alias upload failed" };
+        }
+        if (args[2] === "lease" && args[3] === "release") {
+          return { status: 1, stdout: "", stderr: "lease release failed" };
+        }
+        return azure.run(args);
+      },
+    }),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.message, /Failed to activate .*alias upload failed/);
+      assert.match(error.message, /Unable to release activation lease .*lease release failed/);
+      return true;
+    },
+  );
+  assert.equal(azure.leases.size, 1, "failed release leaves a finite lease, not a permanent lock");
+  for (const lease of azure.leases.values()) lease.expires = performance.now() - 1;
+  await activateCdnAliases({ ...options, run: azure.run });
+  assert.equal(azure.leases.size, 0, "expired lease can be acquired by a new client");
+  await assert.rejects(
+    activateCdnAliases({
+      ...options,
+      run: (args) =>
+        args[2] === "lease" && args[3] === "release"
+          ? { status: 1, stdout: "", stderr: "lease release failed" }
+          : azure.run(args),
+    }),
+    /Unable to release activation lease .*lease release failed/,
+  );
+  for (const lease of azure.leases.values()) lease.expires = performance.now() - 1;
+  await activateCdnAliases({ ...options, run: azure.run });
+  assert.equal(azure.leases.size, 0);
+});
+
+test("the verification CLI reports the overridden full version it actually audited", async (t) => {
+  const { version: packageVersion } = JSON.parse(await readFile(resolve(root, "package.json")));
+  const selectedVersion = "9.8.7-beta.2";
+  assert.notEqual(selectedVersion, packageVersion);
+  const beta = await release(t, selectedVersion);
+  const files = new Map(
+    await Promise.all(
+      getCdnUploads(selectedVersion, "public").map(async (upload) => [
+        `/${upload.blob}`,
+        {
+          ...upload,
+          bytes: await readCdnFile(selectedVersion, upload.file, beta.directory, "public"),
+        },
+      ]),
+    ),
+  );
+  const server = createServer((request, response) => {
+    const file = files.get(request.url);
+    if (!file) return response.writeHead(404).end();
+    response
+      .writeHead(200, {
+        "Content-Type": file.contentType,
+        "Cache-Control": file.cacheControl,
+        "Access-Control-Allow-Origin": "*",
+      })
+      .end(file.bytes);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  const child = spawn(
+    process.execPath,
+    [
+      "scripts/verify-cdn.mjs",
+      "--destination",
+      "public",
+      "--remote-only",
+      "--version",
+      selectedVersion,
+      "--origin",
+      `http://127.0.0.1:${server.address().port}`,
+    ],
+    { cwd: root, timeout: 30_000 },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (data) => {
+    stdout += data;
+  });
+  child.stderr.setEncoding("utf8").on("data", (data) => {
+    stderr += data;
+  });
+  const [status] = await once(child, "close");
+  assert.equal(status, 0, stderr);
+  assert.ok(stdout.endsWith(`Verified 20 CDN files for ${selectedVersion}.\n`), stdout);
+  assert.ok(!stdout.includes(`CDN files for ${packageVersion}.`));
 });

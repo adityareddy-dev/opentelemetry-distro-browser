@@ -186,8 +186,17 @@ cleans up its temporary downloads. Activation checks every immutable object's co
 alias write and verifies its production CDN URLs unless `--container tst` is selected. It skips
 identical aliases, uses the observed ETag when replacing an alias, and requires absence when
 creating one. Missing versions, content differences and failed conditional writes fail activation.
-Each object is guarded independently; the CDN has no atomic multi-file promotion, and clients can
-retain the previous aliases until the 30-minute cache expires. Integrity files are uploaded last.
+All activation clients share a storage lease on
+`<destination>/.major-<major>.activation.lock` in the selected container. Its 60-second lease
+renews during activation and before alias writes; a competing activation fails immediately instead
+of waiting. Renewal failure cancels outstanding Azure work and stops activation; release failures
+are reported, and an abandoned lease expires automatically. Azure CLI operations are bounded to
+30 seconds so renewal can run while commands are in progress. The lock blob itself is not a
+customer artifact and uses `no-store` caching.
+
+The lease serializes writers, but readers still have no atomic multi-file view: interrupted
+activation can leave a partially updated set until a successful retry, and clients can retain
+previous aliases until the 30-minute cache expires. Integrity files are uploaded last.
 `--dry-run` makes no Azure or CDN calls; `--container tst` confines writes to the test container.
 `--destination next` is also supported for an explicit activation retry.
 
