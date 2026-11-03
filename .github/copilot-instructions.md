@@ -108,9 +108,19 @@
   Put findings first, ordered by severity, with precise file and line references. If no defect is
   found, say so and identify any remaining validation gap.
 
+## Distro release review
+
+- When a PR updates the root `package.json` top-level `version` and adds or promotes the matching
+  versioned release in `CHANGELOG.md`, including prereleases, follow the
+  [release-review checklist](skills/onboard-opentelemetry-browser/SKILL.md#review-distro-release-prs).
+- Include a release-process note or checklist asking whether the Rayfin integration and Rayfin
+  documentation were updated for that distro version, with links or a no-change-needed rationale.
+  Check existing PR discussion first to avoid duplicate reminders. Keep this in the PR description
+  or review summary, not an inline code-defect finding; only modify the PR when authorized.
+
 ## Finding format and confidence
 
-- Every review comment must include a final line in the exact format `Confidence: NN%`, where
+- Every review comment reporting a code defect must include a final line in the exact format `Confidence: NN%`, where
   `NN` is an integer from 0 through 100 representing confidence that the reported behavior is a
   real defect introduced or exposed by the change.
 - Calibrate confidence from concrete evidence: reproducible or test-demonstrated failures should

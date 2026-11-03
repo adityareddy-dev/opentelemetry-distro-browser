@@ -1,6 +1,6 @@
 ---
 name: onboard-opentelemetry-browser
-description: Onboard browser applications to @microsoft/opentelemetry-browser with Azure Monitor or OTLP. Use when a customer asks how to add browser telemetry, use the CDN loader snippet, install the npm package, configure automatic or manual telemetry, or validate an integration.
+description: Onboard browser applications to @microsoft/opentelemetry-browser with Azure Monitor or OTLP. Use when a customer asks how to add browser telemetry, use the CDN loader snippet, install the npm package, configure automatic or manual telemetry, or validate an integration. Also use when preparing or reviewing distro release PRs that update CHANGELOG.md and the root package.json version, to check Rayfin integration and documentation updates.
 ---
 
 # Onboard OpenTelemetry Browser
@@ -11,7 +11,8 @@ bundler or needs instrumentation, resource, session, identity, exporter, or life
 the snippet does not expose.
 
 Describe only behavior available in the installed or requested package version. Keep every answer
-focused on active package capabilities and customer setup.
+focused on active package capabilities and customer setup. For distro release PRs, use the
+release-review checklist below instead of the onboarding workflow.
 
 ## Establish the setup
 
@@ -249,6 +250,31 @@ Verify the smallest observable path after making changes:
 Do not claim success from a loaded script alone. Successful onboarding requires initialization and
 an observed telemetry item at the destination. Report CSP, ad blocker, browser privacy control,
 network, ingestion, and configuration failures separately.
+
+## Review distro release PRs
+
+1. Compare the PR head with its base. Treat a change to the root `package.json` top-level `version`
+   together with a new or promoted versioned release heading in `CHANGELOG.md` as a distro release,
+   including prereleases. Confirm both identify the same target version. Dependency-only version
+   changes and edits limited to `Unreleased` are not release signals on their own. If an explicitly
+   identified release PR has missing or mismatched release metadata, flag that separately and still
+   perform the Rayfin check.
+2. Check the PR description, checklist, comments, and linked evidence for confirmation that Rayfin
+   integration and Rayfin documentation were updated for the target distro version. Do not assume a
+   distro version bump proves either update, or invent Rayfin repository or documentation URLs.
+3. Include this release-process checklist in the proposed PR description or review summary, replacing
+   `<version>` with the target distro version:
+
+   - [ ] Has the Rayfin integration been updated and validated with distro `<version>`? Link the
+         integration PR or validation evidence, or explain why no change is needed.
+   - [ ] Has the Rayfin documentation been updated for distro `<version>`? Link the documentation
+         update, or explain why no change is needed.
+
+4. Do not duplicate an existing Rayfin reminder or checklist for the same release. Mark an item
+   complete only when linked evidence or an explicit no-change-needed rationale covers it; leave
+   unconfirmed items unchecked. Treat missing confirmation as a release-process follow-up, not a
+   proven code defect. Post a PR comment or edit its description only when authorized; otherwise
+   provide the suggested checklist text without changing the PR.
 
 ## Use authoritative references
 
