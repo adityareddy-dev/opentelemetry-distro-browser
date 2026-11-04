@@ -22,6 +22,29 @@ import { verifyCdn } from "./verify-cdn.mjs";
 
 export { getCdnUploads };
 
+export async function runCdnCommand(command) {
+  const controller = new AbortController();
+  const cancel = (name, code) => {
+    if (controller.signal.aborted) return;
+    process.exitCode = code;
+    controller.abort(new Error(`CDN operation cancelled by ${name}.`));
+  };
+  const interrupt = () => cancel("SIGINT", 130);
+  const terminate = () => cancel("SIGTERM", 143);
+  process.on("SIGINT", interrupt);
+  process.on("SIGTERM", terminate);
+  try {
+    await command(controller.signal);
+    controller.signal.throwIfAborted();
+  } catch (error) {
+    if (!controller.signal.aborted) throw error;
+    process.stderr.write(`${error.message}\n`);
+  } finally {
+    process.removeListener("SIGINT", interrupt);
+    process.removeListener("SIGTERM", terminate);
+  }
+}
+
 const usage = `Usage: npm run cdn:publish -- --account <storage-account> [--container cdn] [--destination next|public] [--dry-run]
 
 Uploads the files prepared in cdn/ by \`npm run build\` to
@@ -125,47 +148,44 @@ export function runAzureCli(args, { signal, timeoutMs = 30_000 } = {}) {
 
 /** A finite, renewable storage lease serializes all clients writing one major alias set. */
 async function withActivationLease(
-  { version, destination, target, directory, run, log, renewalIntervalMs },
+  { version, destination, target, directory, run, log, renewalIntervalMs, signal },
   activate,
 ) {
   const blob = `${getCdnPath(version, destination)}/.major-${getCdnMajor(version)}.activation.lock`;
-  const existing = await run([
-    "storage",
-    "blob",
-    "show",
-    ...target,
-    "--name",
-    blob,
-    "--output",
-    "none",
-  ]);
+  const existing = await run(
+    ["storage", "blob", "show", ...target, "--name", blob, "--output", "none"],
+    { signal },
+  );
   if (existing.status !== 0) {
     if (!/BlobNotFound|ResourceNotFound|does not exist/i.test(existing.stderr)) {
       throw new Error(`Unable to check activation lock ${blob}: ${existing.stderr.trim()}`);
     }
     const file = resolve(directory, "activation.lock");
     await writeFile(file, "");
-    const created = await run([
-      "storage",
-      "blob",
-      "upload",
-      ...target,
-      "--name",
-      blob,
-      "--file",
-      file,
-      "--content-type",
-      "application/octet-stream",
-      "--content-cache-control",
-      "no-store",
-      "--content-md5",
-      createHash("md5").update("").digest("base64"),
-      "--overwrite",
-      "false",
-      "--if-none-match",
-      "*",
-      "--only-show-errors",
-    ]);
+    const created = await run(
+      [
+        "storage",
+        "blob",
+        "upload",
+        ...target,
+        "--name",
+        blob,
+        "--file",
+        file,
+        "--content-type",
+        "application/octet-stream",
+        "--content-cache-control",
+        "no-store",
+        "--content-md5",
+        createHash("md5").update("").digest("base64"),
+        "--overwrite",
+        "false",
+        "--if-none-match",
+        "*",
+        "--only-show-errors",
+      ],
+      { signal },
+    );
     if (created.status !== 0) {
       if (!/BlobAlreadyExists|ConditionNotMet/i.test(created.stderr)) {
         throw new Error(`Unable to create activation lock ${blob}: ${created.stderr.trim()}`);
@@ -185,21 +205,10 @@ async function withActivationLease(
     "--only-show-errors",
   ];
   let expires = performance.now() + 60_000;
-  const acquired = await run([
-    "storage",
-    "blob",
-    "lease",
-    "acquire",
-    ...leaseArgs,
-    "--lease-duration",
-    "60",
-    "--proposed-lease-id",
-    id,
-  ]);
-  if (acquired.status !== 0) {
-    throw new Error(`Unable to acquire activation lease ${blob}: ${acquired.stderr.trim()}`);
-  }
   const controller = new AbortController();
+  const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  let acquiring = false;
+  let acquired = false;
   let failure;
   let renewing;
   let timer;
@@ -208,12 +217,12 @@ async function withActivationLease(
     if (renewing) return renewing;
     renewing = (async () => {
       try {
-        controller.signal.throwIfAborted();
+        operationSignal.throwIfAborted();
         if (performance.now() >= expires) throw new Error(`Activation lease ${blob} expired.`);
         const started = performance.now();
         const renewed = await run(
           ["storage", "blob", "lease", "renew", ...leaseArgs, "--lease-id", id],
-          { signal: controller.signal },
+          { signal: operationSignal },
         );
         if (renewed.status !== 0) {
           throw new Error(`Unable to renew activation lease ${blob}: ${renewed.stderr.trim()}`);
@@ -235,11 +244,34 @@ async function withActivationLease(
       renew().then(schedule, (error) => log(`Activation stopped: ${error.message}`));
     }, renewalIntervalMs);
   };
-  schedule();
   const errors = [];
   let result;
   try {
-    result = await activate({ renew, signal: controller.signal });
+    operationSignal.throwIfAborted();
+    acquiring = true;
+    const lease = await run(
+      [
+        "storage",
+        "blob",
+        "lease",
+        "acquire",
+        ...leaseArgs,
+        "--lease-duration",
+        "60",
+        "--proposed-lease-id",
+        id,
+      ],
+      { signal: operationSignal },
+    );
+    acquiring = false;
+    if (lease.status !== 0) {
+      throw new Error(`Unable to acquire activation lease ${blob}: ${lease.stderr.trim()}`);
+    }
+    acquired = true;
+    operationSignal.throwIfAborted();
+    schedule();
+    result = await activate({ renew, signal: operationSignal });
+    operationSignal.throwIfAborted();
     if (failure) throw failure;
   } catch (error) {
     if (failure && failure !== error) errors.push(failure);
@@ -254,24 +286,33 @@ async function withActivationLease(
         if (!errors.includes(error)) errors.push(error);
       }
     }
-    try {
-      const released = await run([
-        "storage",
-        "blob",
-        "lease",
-        "release",
-        ...leaseArgs,
-        "--lease-id",
-        id,
-      ]);
-      if (released.status !== 0) {
-        errors.push(
-          new Error(`Unable to release activation lease ${blob}: ${released.stderr.trim()}`),
-        );
+    if (acquired || acquiring) {
+      try {
+        const released = await run([
+          "storage",
+          "blob",
+          "lease",
+          "release",
+          ...leaseArgs,
+          "--lease-id",
+          id,
+        ]);
+        if (released.status !== 0) {
+          if (!acquired && /LeaseNotPresentWith(?:Blob|Lease)Operation/.test(released.stderr)) {
+            log(`Activation lease ${blob} was not acquired before cancellation.`);
+          } else {
+            errors.push(
+              new Error(`Unable to release activation lease ${blob}: ${released.stderr.trim()}`),
+            );
+          }
+        }
+      } catch (error) {
+        errors.push(error);
       }
-    } catch (error) {
-      errors.push(error);
     }
+  }
+  if (operationSignal.aborted && !errors.includes(operationSignal.reason)) {
+    errors.push(operationSignal.reason);
   }
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1)
@@ -286,11 +327,13 @@ export async function publishCdn({
   destination,
   directory = cdnDirectory,
   dryRun = false,
+  signal,
   run = runAzureCli,
   verify = verifyCdn,
   activate = activateCdnAliases,
   log = (line) => process.stdout.write(`${line}\n`),
 }) {
+  signal?.throwIfAborted();
   const uploads = getCdnUploads(version, destination);
   const present = new Set(
     await readdir(directory).catch((error) => {
@@ -311,6 +354,7 @@ export async function publishCdn({
   let temporaryDirectory;
   try {
     for (const upload of uploads) {
+      signal?.throwIfAborted();
       let path = resolve(directory, upload.file);
       if (dryRun) {
         log(`Would upload ${upload.file} -> ${upload.url}`);
@@ -318,18 +362,21 @@ export async function publishCdn({
       }
       const bytes = await readCdnFile(version, upload.file, directory, destination);
       const md5 = createHash("md5").update(bytes).digest("base64");
-      const existing = await run([
-        "storage",
-        "blob",
-        "show",
-        ...target,
-        "--name",
-        upload.blob,
-        "--query",
-        "properties.contentSettings.contentMd5",
-        "--output",
-        "tsv",
-      ]);
+      const existing = await run(
+        [
+          "storage",
+          "blob",
+          "show",
+          ...target,
+          "--name",
+          upload.blob,
+          "--query",
+          "properties.contentSettings.contentMd5",
+          "--output",
+          "tsv",
+        ],
+        { signal },
+      );
       if (existing.status === 0) {
         if (existing.stdout.trim() !== md5) {
           throw new Error(`${upload.url} already exists with different content.`);
@@ -346,25 +393,28 @@ export async function publishCdn({
         path = resolve(temporaryDirectory, upload.file);
         await writeFile(path, bytes);
       }
-      const uploaded = await run([
-        "storage",
-        "blob",
-        "upload",
-        ...target,
-        "--name",
-        upload.blob,
-        "--file",
-        path,
-        "--content-type",
-        upload.contentType,
-        "--content-cache-control",
-        upload.cacheControl,
-        "--content-md5",
-        md5,
-        "--overwrite",
-        "false",
-        "--only-show-errors",
-      ]);
+      const uploaded = await run(
+        [
+          "storage",
+          "blob",
+          "upload",
+          ...target,
+          "--name",
+          upload.blob,
+          "--file",
+          path,
+          "--content-type",
+          upload.contentType,
+          "--content-cache-control",
+          upload.cacheControl,
+          "--content-md5",
+          md5,
+          "--overwrite",
+          "false",
+          "--only-show-errors",
+        ],
+        { signal },
+      );
       if (uploaded.status !== 0) {
         throw new Error(`Failed to upload ${upload.url}: ${uploaded.stderr.trim()}`);
       }
@@ -372,7 +422,7 @@ export async function publishCdn({
     }
     if (!dryRun) {
       if (container === "tst") log("Skipped public CDN verification for isolated tst container.");
-      else await verify({ version, directory, destination, log });
+      else await verify({ version, directory, destination, log, signal });
     }
     if (destination === "next") {
       await activate({
@@ -382,6 +432,7 @@ export async function publishCdn({
         destination,
         directory,
         dryRun,
+        signal,
         run,
         log,
         verify: async () => {},
@@ -402,11 +453,13 @@ export async function activateCdnAliases({
   directory = cdnDirectory,
   fromStorage = false,
   dryRun = false,
+  signal,
   run = runAzureCli,
   verify = verifyCdn,
   renewalIntervalMs = 15_000,
   log = (line) => process.stdout.write(`${line}\n`),
 }) {
+  signal?.throwIfAborted();
   const aliases = getCdnAliasUploads(version, destination);
   if (!Number.isFinite(renewalIntervalMs) || renewalIntervalMs <= 0 || renewalIntervalMs > 15_000) {
     throw new Error("Activation lease renewal interval must be between 0 and 15000 ms.");
@@ -423,33 +476,39 @@ export async function activateCdnAliases({
     if (fromStorage) directory = temporaryDirectory;
     // Check every immutable object before changing any alias, including in the isolated tst container.
     for (const upload of uploads) {
-      const existing = await run([
-        "storage",
-        "blob",
-        "show",
-        ...target,
-        "--name",
-        upload.blob,
-        "--query",
-        "properties.contentSettings.contentMd5",
-        "--output",
-        "tsv",
-      ]);
+      const existing = await run(
+        [
+          "storage",
+          "blob",
+          "show",
+          ...target,
+          "--name",
+          upload.blob,
+          "--query",
+          "properties.contentSettings.contentMd5",
+          "--output",
+          "tsv",
+        ],
+        { signal },
+      );
       if (existing.status !== 0) {
         throw new Error(`Unable to activate unpublished ${upload.url}: ${existing.stderr.trim()}`);
       }
       if (fromStorage) {
-        const downloaded = await run([
-          "storage",
-          "blob",
-          "download",
-          ...target,
-          "--name",
-          upload.blob,
-          "--file",
-          resolve(directory, upload.file),
-          "--only-show-errors",
-        ]);
+        const downloaded = await run(
+          [
+            "storage",
+            "blob",
+            "download",
+            ...target,
+            "--name",
+            upload.blob,
+            "--file",
+            resolve(directory, upload.file),
+            "--only-show-errors",
+          ],
+          { signal },
+        );
         if (downloaded.status !== 0) {
           throw new Error(`Unable to download ${upload.url}: ${downloaded.stderr.trim()}`);
         }
@@ -461,7 +520,7 @@ export async function activateCdnAliases({
       }
     }
     const prepared = await prepareCdnAliases(version, directory, destination);
-    if (container !== "tst") await verify({ version, directory, destination, log });
+    if (container !== "tst") await verify({ version, directory, destination, log, signal });
     return await withActivationLease(
       {
         version,
@@ -471,6 +530,7 @@ export async function activateCdnAliases({
         run,
         log,
         renewalIntervalMs,
+        signal,
       },
       async ({ renew, signal }) => {
         for (const alias of prepared) {
@@ -563,11 +623,14 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     process.exit(values.help ? 0 : 1);
   }
   const { version } = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
-  await publishCdn({
-    version,
-    account: values.account,
-    container: values.container,
-    destination: values.destination,
-    dryRun: values["dry-run"],
-  });
+  await runCdnCommand((signal) =>
+    publishCdn({
+      version,
+      account: values.account,
+      container: values.container,
+      destination: values.destination,
+      dryRun: values["dry-run"],
+      signal,
+    }),
+  );
 }

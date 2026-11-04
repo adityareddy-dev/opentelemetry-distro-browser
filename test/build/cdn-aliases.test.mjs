@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { readFileSync, writeFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { delimiter, resolve } from "node:path";
@@ -147,6 +147,174 @@ async function release(t, version) {
   const outputDirectory = resolve(directory, "cdn");
   await prepareCdn({ version, sourceDirectory, outputDirectory });
   return { version, directory: outputDirectory };
+}
+
+async function signalCliFixture(t, publishing) {
+  const beta = await release(t, "0.1.0-beta.1");
+  const project = resolve(beta.directory, "..");
+  const scripts = resolve(project, "scripts");
+  await mkdir(scripts);
+  for (const file of [
+    "cdn.mjs",
+    "publish-cdn.mjs",
+    "activate-cdn.mjs",
+    "verify-cdn.mjs",
+    "check-node-version.mjs",
+  ]) {
+    await copyFile(resolve(root, "scripts", file), resolve(scripts, file));
+  }
+  await writeFile(resolve(project, "package.json"), JSON.stringify({ version: beta.version }));
+  const stateFile = resolve(project, "storage.json");
+  const readyFile = resolve(project, "ready.json");
+  const lateFile = resolve(project, "late-upload");
+  const releasedFile = resolve(project, "released");
+  const state = { blobs: {}, lease: null };
+  if (!publishing) {
+    for (const upload of getCdnUploads(beta.version, "public")) {
+      const bytes = await readCdnFile(beta.version, upload.file, beta.directory, "public");
+      state.blobs[upload.blob] = { bytes: bytes.toString("base64"), md5: md5(bytes) };
+    }
+  }
+  await writeFile(stateFile, JSON.stringify(state));
+  const worker = resolve(project, "worker.cjs");
+  await writeFile(
+    worker,
+    `
+const fs = require("node:fs");
+const ready = ${JSON.stringify(readyFile)};
+fs.writeFileSync(ready + ".tmp", JSON.stringify({
+  pid: process.pid, file: process.argv[2]
+}));
+fs.renameSync(ready + ".tmp", ready);
+setTimeout(() => fs.writeFileSync(${JSON.stringify(lateFile)}, "uploaded"), 1000);
+setInterval(() => {}, 1000);
+`,
+  );
+  const runner = resolve(project, "azure.cjs");
+  await writeFile(
+    runner,
+    `
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const option = (key) => args[args.indexOf(key) + 1];
+const file = ${JSON.stringify(stateFile)};
+const state = JSON.parse(fs.readFileSync(file));
+const save = () => fs.writeFileSync(file, JSON.stringify(state));
+const fail = (error) => { process.stderr.write(error); process.exit(1); };
+const name = option("--name");
+if (args[2] === "lease") {
+  if (args[3] === "acquire") {
+    state.lease = option("--proposed-lease-id");
+    save();
+  } else {
+    if (state.lease !== option("--lease-id")) fail("LeaseIdMismatch");
+    if (args[3] === "release") {
+      setTimeout(() => {
+        state.lease = null;
+        save();
+        fs.writeFileSync(${JSON.stringify(releasedFile)}, "released");
+      }, 200);
+    }
+  }
+} else if (args[2] === "show") {
+  const blob = state.blobs[name];
+  if (!blob) fail("BlobNotFound");
+  if (option("--output") === "json") process.stdout.write(JSON.stringify(blob));
+  else if (option("--output") !== "none") process.stdout.write(blob.md5);
+} else if (args[2] === "download") {
+  fs.writeFileSync(option("--file"), Buffer.from(state.blobs[name].bytes, "base64"));
+} else if (args[2] === "upload") {
+  if (option("--content-cache-control") === ${JSON.stringify(aliasCacheControl)}) {
+    if (!state.lease) fail("Alias write without lease");
+    require("node:child_process").spawn(process.execPath,
+      [${JSON.stringify(worker)}, option("--file")],
+      { stdio: "inherit" });
+  } else {
+    const bytes = fs.readFileSync(option("--file"));
+    state.blobs[name] = { bytes: bytes.toString("base64"), md5: option("--content-md5") };
+    save();
+  }
+} else fail("Unsupported fake Azure command");
+`,
+  );
+  const executable = resolve(project, "az");
+  await writeFile(executable, `#!/bin/sh\n"${process.execPath}" "${runner}" "$@"\n`);
+  await chmod(executable, 0o755);
+  const script = publishing ? "publish-cdn.mjs" : "activate-cdn.mjs";
+  const args = [
+    resolve(scripts, script),
+    "--account",
+    "fixture",
+    "--container",
+    "tst",
+    "--destination",
+    publishing ? "next" : "public",
+  ];
+  if (!publishing) args.push("--from-storage");
+  const cli = spawn(process.execPath, args, {
+    cwd: project,
+    env: { ...process.env, PATH: `${project}${delimiter}${process.env.PATH}` },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const closed = once(cli, "close");
+  let stderr = "";
+  cli.stdout.resume();
+  cli.stderr.on("data", (bytes) => {
+    stderr += bytes;
+  });
+  let ready;
+  let needsCleanup = true;
+  t.after(async () => {
+    if (needsCleanup && ready) {
+      try {
+        process.kill(ready.pid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    if (cli.exitCode === null && cli.signalCode === null) cli.kill("SIGKILL");
+    await closed;
+  });
+  const deadline = performance.now() + 20_000;
+  while (performance.now() < deadline && !ready) {
+    try {
+      ready = JSON.parse(await readFile(readyFile, "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      await delay(10);
+    }
+  }
+  assert.ok(ready, `CLI did not reach an alias upload: ${stderr}`);
+  assert.ok(JSON.parse(await readFile(stateFile, "utf8")).lease, "activation must hold its lease");
+  return {
+    async cancel(signal, code) {
+      cli.kill(signal);
+      assert.deepEqual(await closed, [code, null], stderr);
+      assert.match(stderr, new RegExp(`CDN operation cancelled by ${signal}`));
+      assert.equal(await readFile(releasedFile, "utf8"), "released");
+      assert.equal(JSON.parse(await readFile(stateFile, "utf8")).lease, null);
+      await assert.rejects(readFile(ready.file), { code: "ENOENT" });
+      needsCleanup = false;
+      await delay(1_200);
+      await assert.rejects(readFile(lateFile), { code: "ENOENT" });
+    },
+  };
+}
+
+for (const publishing of [true, false]) {
+  for (const [signal, code] of [
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+  ]) {
+    test(
+      `${publishing ? "publishing" : "storage-only activation"} CLI ${signal} stops descendants and awaits lease cleanup`,
+      { skip: process.platform === "win32", timeout: 30_000 },
+      async (t) => {
+        const fixture = await signalCliFixture(t, publishing);
+        await fixture.cancel(signal, code);
+      },
+    );
+  }
 }
 
 function storage() {
@@ -689,6 +857,115 @@ test(
     await assert.rejects(readFile(temporaryFile), { code: "ENOENT" });
   },
 );
+
+for (const phase of ["acquire", "upload", "release"]) {
+  test(`parent cancellation during lease ${phase} awaits cleanup and fails activation`, async (t) => {
+    const azure = storage();
+    const beta = await release(t, "0.1.0-beta.1");
+    const controller = new AbortController();
+    const cancelled = new Error("Parent operation cancelled.");
+    const options = {
+      ...beta,
+      account: "store",
+      container: "tst",
+      destination: "public",
+      log: () => {},
+    };
+    await publishCdn({ ...options, run: azure.run });
+    let released = false;
+    const run = (args, options) => {
+      if (args[2] === "lease" && args[3] === "release") {
+        assert.equal(
+          options?.signal,
+          undefined,
+          "cleanup must remain executable after cancellation",
+        );
+        released = true;
+        if (phase === "release") controller.abort(cancelled);
+      }
+      if (phase === "acquire" && args[2] === "lease" && args[3] === "acquire") {
+        azure.run(args);
+        controller.abort(cancelled);
+        options.signal.throwIfAborted();
+      }
+      if (phase === "upload" && args[2] === "upload" && args.includes(aliasCacheControl)) {
+        controller.abort(cancelled);
+        options.signal.throwIfAborted();
+      }
+      return azure.run(args);
+    };
+    await assert.rejects(
+      activateCdnAliases({ ...options, run, signal: controller.signal }),
+      (error) => error === cancelled,
+    );
+    assert.equal(released, true);
+    assert.equal(azure.leases.size, 0);
+    if (phase !== "release") {
+      assert.ok(!azure.blobs.has("tst/scripts/otel/opentelemetry-browser.0.min.js"));
+    }
+  });
+}
+
+test("parent cancellation surfaces lease cleanup failure", async (t) => {
+  const azure = storage();
+  const beta = await release(t, "0.1.0-beta.1");
+  const controller = new AbortController();
+  const options = {
+    ...beta,
+    account: "store",
+    container: "tst",
+    destination: "public",
+    log: () => {},
+  };
+  await publishCdn({ ...options, run: azure.run });
+  const run = (args, options) => {
+    if (args[2] === "upload" && args.includes(aliasCacheControl)) {
+      controller.abort(new Error("Parent operation cancelled."));
+      options.signal.throwIfAborted();
+    }
+    if (args[2] === "lease" && args[3] === "release") {
+      return { status: 1, stdout: "", stderr: "release failed" };
+    }
+    return azure.run(args);
+  };
+  await assert.rejects(
+    activateCdnAliases({ ...options, run, signal: controller.signal }),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.message, /Parent operation cancelled/);
+      assert.match(error.message, /Unable to release activation lease .*release failed/);
+      return true;
+    },
+  );
+});
+
+for (const stage of ["request", "body"]) {
+  test(`parent cancellation stops CDN verification during ${stage} without subsequent requests`, async (t) => {
+    const beta = await release(t, "0.1.0-beta.1");
+    const controller = new AbortController();
+    const cancelled = new Error("Verification cancelled.");
+    let requests = 0;
+    const fetch = async (_url, { signal }) => {
+      requests++;
+      if (stage === "request") {
+        controller.abort(cancelled);
+        throw signal.reason;
+      }
+      return {
+        status: 200,
+        arrayBuffer: async () => {
+          controller.abort(cancelled);
+          throw signal.reason;
+        },
+      };
+    };
+    await assert.rejects(
+      verifyCdn({ ...beta, fetch, signal: controller.signal, log: () => {} }),
+      (error) => error === cancelled,
+    );
+    assert.equal(requests, 1);
+  });
+}
 
 test("lease acquisition, release and alias-write failures are surfaced without leaking timers", async (t) => {
   const azure = storage();

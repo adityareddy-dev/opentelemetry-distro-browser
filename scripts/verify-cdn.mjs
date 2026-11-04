@@ -47,8 +47,10 @@ export async function verifyCdn({
   origin = cdnOrigin,
   fetch = globalThis.fetch,
   timeoutMs = 60_000,
+  signal: cancellationSignal,
   log = (line) => process.stdout.write(`${line}\n`),
 }) {
+  cancellationSignal?.throwIfAborted();
   const toServed = (url) => (origin === cdnOrigin ? url : url.replace(cdnOrigin, origin));
   const problems = [];
   const served = new Map();
@@ -67,10 +69,12 @@ export async function verifyCdn({
   const fileVersion = major ? getCdnMajor(version) : version;
 
   for (const upload of uploads) {
+    cancellationSignal?.throwIfAborted();
     const url = toServed(upload.url);
     const fail = (problem) => problems.push(`${url}: ${problem}`);
     // One deadline covers both the headers and the body.
-    const signal = AbortSignal.timeout(timeoutMs);
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const signal = cancellationSignal ? AbortSignal.any([cancellationSignal, deadline]) : deadline;
     let response;
     try {
       response = await fetch(url, {
@@ -79,6 +83,7 @@ export async function verifyCdn({
         signal,
       });
     } catch (error) {
+      cancellationSignal?.throwIfAborted();
       fail(`request failed (${error.message})`);
       continue;
     }
@@ -91,6 +96,7 @@ export async function verifyCdn({
     try {
       bytes = Buffer.from(await response.arrayBuffer());
     } catch (error) {
+      cancellationSignal?.throwIfAborted();
       fail(
         `download failed (${signal.aborted ? `timed out after ${timeoutMs} ms` : error.message})`,
       );
@@ -122,6 +128,7 @@ export async function verifyCdn({
     log(`Checked ${url}`);
   }
 
+  cancellationSignal?.throwIfAborted();
   for (const [url, bytes] of served) {
     if (!url.endsWith(".integrity.json")) continue;
     let integrity;

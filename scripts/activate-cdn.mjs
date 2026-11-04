@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { root } from "./cdn.mjs";
-import { activateCdnAliases } from "./publish-cdn.mjs";
+import { activateCdnAliases, runCdnCommand } from "./publish-cdn.mjs";
 
 const usage = `Usage: npm run cdn:activate -- --account <storage-account> --destination next|public
   [--container cdn] [--version <full-version>] [--from-storage] [--dry-run]
@@ -34,12 +34,15 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     process.exit(values.help ? 0 : 1);
   }
   const { version } = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
-  await activateCdnAliases({
-    version: values.version ?? version,
-    account: values.account,
-    container: values.container,
-    destination: values.destination,
-    fromStorage: values["from-storage"],
-    dryRun: values["dry-run"],
-  });
+  await runCdnCommand((signal) =>
+    activateCdnAliases({
+      version: values.version ?? version,
+      account: values.account,
+      container: values.container,
+      destination: values.destination,
+      fromStorage: values["from-storage"],
+      dryRun: values["dry-run"],
+      signal,
+    }),
+  );
 }

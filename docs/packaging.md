@@ -194,6 +194,12 @@ are reported, and an abandoned lease expires automatically. Azure CLI operations
 30 seconds so renewal can run while commands are in progress. The lock blob itself is not a
 customer artifact and uses `no-store` caching.
 
+Both publication and activation handle `SIGINT`/`SIGTERM` by cancelling active Azure commands,
+stopping further uploads, and awaiting lease and temporary-file cleanup before exiting with
+status 130/143. Cancellation kills isolated POSIX process groups or Windows process trees;
+lease release is attempted separately even after cancellation. This cannot undo writes already
+accepted by storage or provide an atomic multi-file rollback.
+
 The lease serializes writers, but readers still have no atomic multi-file view: interrupted
 activation can leave a partially updated set until a successful retry, and clients can retain
 previous aliases until the 30-minute cache expires. Integrity files are uploaded last.

@@ -63,6 +63,8 @@ false` blocks SDK-managed storage access, including later identity-control calls
 ### Changed
 
 - Use the selected release version consistently for CDN verification and its success output.
+- Cancel active CDN publishing and promotion commands on SIGINT/SIGTERM, awaiting subprocess
+  termination and lease cleanup before exiting.
 - Require Node.js 22.23.4+, 24.22.1+, or 26.12.1+ for repository tooling to address
   CVE-2026-111497. Enforce patched minimums in CI and installs, and reject unsupported
   runtimes before CDN verification/publishing and performance network operations.
