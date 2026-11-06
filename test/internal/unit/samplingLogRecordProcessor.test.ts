@@ -2,7 +2,11 @@
 // Licensed under the MIT License.
 
 import { TraceFlags, type SpanContext } from "@opentelemetry/api";
-import { InMemoryLogRecordExporter, type ReadWriteLogRecord } from "@opentelemetry/sdk-logs";
+import {
+  InMemoryLogRecordExporter,
+  LoggerProvider,
+  type ReadWriteLogRecord,
+} from "@opentelemetry/sdk-logs";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -78,6 +82,43 @@ async function exportRecords(
 }
 
 describe("AzureMonitorSamplingLogRecordProcessor", () => {
+  it("preserves attributes added by later processors without sharing sampling metadata", async () => {
+    const exporter = new InMemoryLogRecordExporter();
+    const sampling = new AzureMonitorSamplingLogRecordProcessor(
+      { exporter, samplingPercentage: 50 },
+      () => 0,
+    );
+    const observer = new InMemoryLogRecordExporter();
+    const provider = new LoggerProvider({
+      processors: [
+        sampling,
+        {
+          onEmit(record) {
+            record.setAttribute("enriched", true);
+            observer.export([record], () => {});
+          },
+          async forceFlush() {},
+          async shutdown() {},
+        },
+      ],
+    });
+    try {
+      provider.getLogger("test").emit({ body: "sampled log", attributes: { original: true } });
+      await provider.forceFlush();
+      expect(exporter.getFinishedLogRecords()[0].attributes).toEqual({
+        original: true,
+        enriched: true,
+        [AZURE_MONITOR_SAMPLE_RATE]: 50,
+      });
+      expect(observer.getFinishedLogRecords()[0].attributes).toEqual({
+        original: true,
+        enriched: true,
+      });
+    } finally {
+      await provider.shutdown();
+    }
+  });
+
   it.each([sampledContext, unsampledContext, undefined])(
     "reads sampling once per emit and forwards undefined policy unchanged (%j)",
     async (spanContext) => {

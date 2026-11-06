@@ -70,10 +70,10 @@ export class AzureMonitorSamplingLogRecordProcessor extends BrowserBatchLogRecor
     if (effectiveSampleRate < 100 && currentSampleRate !== effectiveSampleRate) {
       const azureRecord = Object.create(record, {
         attributes: {
-          value: {
+          get: () => ({
             ...record.attributes,
             [AZURE_MONITOR_SAMPLE_RATE]: effectiveSampleRate,
-          },
+          }),
         },
       }) as ReadWriteLogRecord;
       copyManagedOperationName(record, azureRecord);

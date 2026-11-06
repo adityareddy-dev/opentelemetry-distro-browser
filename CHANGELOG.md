@@ -4,6 +4,10 @@ All notable changes to this package are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Preserve attributes added by later log processors when Azure Monitor sampling adds metadata.
+
 ### Added
 
 - Document ApplicationInsights-JS migration paths, intentional exclusions and current gaps.
